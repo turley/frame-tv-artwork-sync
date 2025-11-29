@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  frame-tv-sync:
+    image: turley/frame-tv-artwork-sync
+    restart: unless-stopped
+    environment:
+      # Comma-separated list of TV IP addresses
+      TV_IPS: "192.168.1.100,192.168.1.101"
+
+      # How often to check and sync (in minutes)
+      SYNC_INTERVAL_MINUTES: "5"
+
+      # Matte style: none, shadowbox_polar, modern_apricot, etc.
+      MATTE_STYLE: "none"
+    volumes:
+      # Map your local artwork folder to /artwork in container
+      - ./artwork:/artwork
+
+      # Persist TV authentication tokens
+      - ./tokens:/tokens
