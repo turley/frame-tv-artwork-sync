@@ -57,19 +57,38 @@ docker run -d \
 
 All settings are configured via environment variables in [docker-compose.yml](docker-compose.yml):
 
-| Variable                | Description                                            | Default |
-| ----------------------- | ------------------------------------------------------ | ------- |
-| `TV_IPS`                | Comma-separated TV IP addresses (required)             | -       |
-| `SYNC_INTERVAL_MINUTES` | How often to sync (in minutes)                         | `5`     |
-| `MATTE_STYLE`           | Border style (see [Matte Styles](#matte-styles) below) | `none`  |
+| Variable                | Description                                                           | Default   |
+| ----------------------- | --------------------------------------------------------------------- | --------- |
+| `TV_IPS`                | Comma-separated TV IP addresses (required)                            | -         |
+| `SYNC_INTERVAL_MINUTES` | How often to sync (in minutes)                                        | `5`       |
+| `MATTE_STYLE`           | Border style (see [Matte Styles](#matte-styles) below)                | `none`    |
+| `SLIDESHOW_ENABLED`     | Enable slideshow (true/false) - overrides TV settings if set          | (unset)   |
+| `SLIDESHOW_INTERVAL`    | Slideshow interval in minutes (use values supported by your TV model) | `15`      |
+| `SLIDESHOW_TYPE`        | Slideshow type: `shuffle` or `sequential` - requires override enabled | `shuffle` |
+| `BRIGHTNESS`            | Art mode brightness (use values supported by your TV model, commonly 0-10 or 0-50) | (unset)   |
 
-**Note:** Slideshow interval and brightness must be configured manually via the SmartThings app or TV settings. The sync script will automatically preserve and restore your slideshow settings after syncing new images.
+### Slideshow & Brightness Control
+
+**Default Behavior (no override variables set):**
+
+- When images are added or removed during sync, the script preserves and restores your TV's current slideshow settings
+- If no images change, settings are not modified
+
+**Override Behavior (if any slideshow variable is set):**
+
+- When images are added or removed during sync, the script applies slideshow settings from environment variables
+- If you set `SLIDESHOW_ENABLED`, `SLIDESHOW_INTERVAL`, or `SLIDESHOW_TYPE`, all slideshow variables use defaults for any unset values
+- `BRIGHTNESS` is independent - setting it applies brightness without affecting slideshow behavior
+- If no images change, settings are not modified
+
+**Note:** Slideshow interval values and brightness ranges vary by TV model year. Common slideshow intervals include 3, 15, 60, 720, 1440 minutes. Common brightness ranges are 0-10 or 0-50. Check your TV's settings menu to see which values are supported by your specific model.
 
 ## Image Requirements
 
 **Supported Formats:** JPEG, JPG, PNG
 
 **Recommended Specs:**
+
 - Resolution: 3840 x 2160 pixels (4K) for 43"+ TVs, 1920 x 1080 for 32" TVs
 - Aspect ratio: 16:9
 - File size: Under 20MB

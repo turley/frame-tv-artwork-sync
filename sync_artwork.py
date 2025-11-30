@@ -32,6 +32,16 @@ SYNC_INTERVAL_MINUTES = int(os.getenv('SYNC_INTERVAL_MINUTES', '5'))
 MATTE_STYLE = os.getenv('MATTE_STYLE', 'none')
 TOKEN_DIR = os.getenv('TOKEN_DIR', '/tokens')
 
+# Optional slideshow override settings (if any are set, all are used with defaults)
+SLIDESHOW_ENABLED = os.getenv('SLIDESHOW_ENABLED', '').lower() in ('true', '1', 'yes')
+SLIDESHOW_INTERVAL = int(os.getenv('SLIDESHOW_INTERVAL', '15'))
+SLIDESHOW_TYPE = os.getenv('SLIDESHOW_TYPE', 'shuffle').lower()
+SLIDESHOW_OVERRIDE = os.getenv('SLIDESHOW_ENABLED') or os.getenv('SLIDESHOW_INTERVAL') or os.getenv('SLIDESHOW_TYPE')
+
+# Optional brightness setting (0-50, where 50 is brightest)
+BRIGHTNESS = os.getenv('BRIGHTNESS', '')
+BRIGHTNESS = int(BRIGHTNESS) if BRIGHTNESS else None
+
 # Supported image formats
 SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
 
@@ -235,6 +245,24 @@ class TVArtworkSync:
             logger.debug(f"Could not restart slideshow on TV {self.tv_ip}: {e}")
             return False
 
+    async def set_brightness(self, brightness: int) -> bool:
+        """Set brightness on the TV (0-50 range)"""
+        try:
+            logger.info(f"Setting brightness to {brightness} on TV {self.tv_ip}")
+
+            result = await self.tv.set_brightness(brightness)
+
+            if result:
+                logger.info(f"Successfully set brightness on TV {self.tv_ip}")
+                return True
+            else:
+                logger.debug(f"Brightness setting returned no response on TV {self.tv_ip}")
+                return False
+
+        except Exception as e:
+            logger.warning(f"Could not set brightness on TV {self.tv_ip}: {e}")
+            return False
+
     async def delete_image(self, filename: str) -> bool:
         """Delete an image from the TV"""
         try:
@@ -273,10 +301,32 @@ class TVArtworkSync:
 
             logger.info(f"TV {self.tv_ip} sync: {len(to_upload)} to upload, {len(to_delete)} to delete")
 
-            # If we're going to make changes, capture slideshow settings FIRST (before any operations)
+            # If we're going to make changes, determine slideshow/brightness settings to apply
             slideshow_settings = None
+            brightness_to_apply = None
+
             if (to_upload or to_delete) and local_images:
-                slideshow_settings = await self.get_slideshow_settings()
+                # Check if we should use override settings or preserve TV's current settings
+                if SLIDESHOW_OVERRIDE:
+                    # Use environment variable override settings
+                    if SLIDESHOW_ENABLED:
+                        slideshow_type = 'shuffleslideshow' if SLIDESHOW_TYPE == 'shuffle' else 'slideshow'
+                        slideshow_settings = {
+                            'value': str(SLIDESHOW_INTERVAL),
+                            'type': slideshow_type,
+                            'category_id': 'MY-C0002'
+                        }
+                        logger.info(f"Using slideshow override: {SLIDESHOW_INTERVAL} min, {SLIDESHOW_TYPE}")
+                    else:
+                        logger.info(f"Slideshow override set to disabled")
+                else:
+                    # Preserve and restore TV's current slideshow settings
+                    slideshow_settings = await self.get_slideshow_settings()
+
+                # Check if brightness override is set
+                if BRIGHTNESS is not None:
+                    brightness_to_apply = BRIGHTNESS
+                    logger.info(f"Using brightness override: {BRIGHTNESS}")
 
             # Upload new images
             for filename in to_upload:
@@ -299,9 +349,13 @@ class TVArtworkSync:
                         logger.info(f"Selecting first image on TV {self.tv_ip} to prevent default art")
                         await self.tv.select_image(first_image_content_id, show=True)
 
-                        # If slideshow was enabled, restart it with the same settings
+                        # Apply slideshow settings (either from override or preserved from TV)
                         if slideshow_settings:
                             await self.restart_slideshow(slideshow_settings)
+
+                        # Apply brightness setting if specified
+                        if brightness_to_apply is not None:
+                            await self.set_brightness(brightness_to_apply)
 
                     except Exception as e:
                         logger.warning(f"Failed to select image on TV {self.tv_ip}: {e}")

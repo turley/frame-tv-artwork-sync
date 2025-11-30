@@ -13,6 +13,15 @@ services:
 
       # Matte style: none, shadowbox_polar, modern_apricot, etc.
       MATTE_STYLE: "none"
+
+      # Optional: Slideshow & Brightness Control
+      # Uncomment to override TV's slideshow settings:
+      # SLIDESHOW_ENABLED: "true"
+      # SLIDESHOW_INTERVAL: "15"  # Use value supported by your TV (e.g., 3, 15, 60, 720, 1440)
+      # SLIDESHOW_TYPE: "shuffle"  # shuffle or sequential
+
+      # Uncomment to control brightness (use value supported by your TV model):
+      # BRIGHTNESS: "5"
     volumes:
       # Map your local artwork folder to /artwork in container
       - ./artwork:/artwork
