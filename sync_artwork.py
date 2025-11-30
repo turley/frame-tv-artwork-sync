@@ -53,6 +53,9 @@ LOCATION_TIMEZONE = os.getenv('LOCATION_TIMEZONE', 'UTC')
 BRIGHTNESS_MIN = int(os.getenv('BRIGHTNESS_MIN', '2'))
 BRIGHTNESS_MAX = int(os.getenv('BRIGHTNESS_MAX', '10'))
 
+# Optional cleanup setting
+REMOVE_UNKNOWN_IMAGES = os.getenv('REMOVE_UNKNOWN_IMAGES', '').lower() in ('true', '1', 'yes')
+
 # Validate brightness range
 if BRIGHTNESS_MIN >= BRIGHTNESS_MAX:
     logger.warning(f"Invalid brightness range: BRIGHTNESS_MIN ({BRIGHTNESS_MIN}) must be less than BRIGHTNESS_MAX ({BRIGHTNESS_MAX}). Solar brightness will not function correctly.")
@@ -65,6 +68,7 @@ CONNECTION_TIMEOUT = 10.0
 API_TIMEOUT = 10
 UPLOAD_DELAY = 1.0
 DELETE_DELAY = 0.5
+UPLOAD_RETRY_ATTEMPTS = 2
 
 
 def brightness_from_elevation(elevation: float) -> int:
@@ -220,8 +224,15 @@ class TVArtworkSync:
         logger.info(f"Found {len(local_files)} images in {ARTWORK_DIR}")
         return local_files
 
-    async def get_tv_images(self) -> Set[str]:
-        """Get list of uploaded images on the TV using our mapping"""
+    async def get_tv_images(self) -> tuple[Set[str], Set[str]]:
+        """
+        Get list of uploaded images on the TV.
+
+        Returns:
+            Tuple of (tracked_files, unknown_content_ids):
+            - tracked_files: Set of filenames we've uploaded and are tracking
+            - unknown_content_ids: Set of content_ids on TV that we don't recognize
+        """
         try:
             # Get available images from "MY-C0002" category (My Photos/uploaded images only)
             available = await self.tv.available(category='MY-C0002')
@@ -237,43 +248,58 @@ class TVArtworkSync:
                         tv_content_ids.add(item['content_id'])
 
             # Map content_ids back to filenames using our mapping
-            tv_files = set()
+            tracked_files = set()
+            unknown_content_ids = set()
             reverse_mapping = {v: k for k, v in self.file_mapping.items()}
+
             for content_id in tv_content_ids:
                 if content_id in reverse_mapping:
-                    tv_files.add(reverse_mapping[content_id])
+                    tracked_files.add(reverse_mapping[content_id])
+                else:
+                    unknown_content_ids.add(content_id)
 
-            logger.info(f"TV {self.tv_ip} has {len(tv_files)} tracked uploaded images")
-            return tv_files
+            logger.info(f"TV {self.tv_ip} has {len(tracked_files)} tracked images, {len(unknown_content_ids)} unknown images")
+            return tracked_files, unknown_content_ids
 
         except Exception as e:
             logger.warning(f"Failed to get uploaded images from TV {self.tv_ip}: {e}")
-            return set()
+            return set(), set()
 
     async def upload_image(self, file_path: Path) -> bool:
-        """Upload a single image to the TV"""
-        try:
-            logger.info(f"Uploading {file_path.name} to TV {self.tv_ip}")
+        """Upload a single image to the TV with retry logic"""
+        for attempt in range(UPLOAD_RETRY_ATTEMPTS):
+            try:
+                if attempt > 0:
+                    logger.info(f"Retrying upload of {file_path.name} to TV {self.tv_ip} (attempt {attempt + 1}/{UPLOAD_RETRY_ATTEMPTS})")
+                else:
+                    logger.info(f"Uploading {file_path.name} to TV {self.tv_ip}")
 
-            content_id = await self.tv.upload(
-                file=str(file_path),
-                file_type='png' if file_path.suffix.lower() == '.png' else 'jpg',
-                matte=MATTE_STYLE if MATTE_STYLE != 'none' else None
-            )
+                content_id = await self.tv.upload(
+                    file=str(file_path),
+                    file_type='png' if file_path.suffix.lower() == '.png' else 'jpg',
+                    matte=MATTE_STYLE if MATTE_STYLE != 'none' else None
+                )
 
-            if content_id:
-                # Save the mapping
-                self.file_mapping[file_path.name] = content_id
-                self._save_mapping()
-                logger.info(f"Successfully uploaded {file_path.name} to TV {self.tv_ip} (content_id: {content_id})")
-                return True
-            else:
-                logger.warning(f"Failed to upload {file_path.name} to TV {self.tv_ip}")
-                return False
+                if content_id:
+                    # Save the mapping
+                    self.file_mapping[file_path.name] = content_id
+                    self._save_mapping()
+                    logger.info(f"Successfully uploaded {file_path.name} to TV {self.tv_ip} (content_id: {content_id})")
+                    return True
+                else:
+                    logger.warning(f"Upload returned no content_id for {file_path.name} to TV {self.tv_ip}")
+                    if attempt < UPLOAD_RETRY_ATTEMPTS - 1:
+                        await asyncio.sleep(UPLOAD_DELAY)
+                    continue
 
-        except Exception as e:
-            logger.warning(f"Error uploading {file_path.name} to TV {self.tv_ip}: {e}")
-            return False
+            except Exception as e:
+                logger.warning(f"Error uploading {file_path.name} to TV {self.tv_ip}: {e}")
+                if attempt < UPLOAD_RETRY_ATTEMPTS - 1:
+                    await asyncio.sleep(UPLOAD_DELAY)
+                continue
+
+        logger.warning(f"Failed to upload {file_path.name} to TV {self.tv_ip} after {UPLOAD_RETRY_ATTEMPTS} attempts")
+        return False
 
     async def get_slideshow_settings(self) -> Optional[Dict[str, Any]]:
         """Get current slideshow settings from the TV"""
@@ -357,28 +383,6 @@ class TVArtworkSync:
             logger.warning(f"Could not set brightness on TV {self.tv_ip}: {e}")
             return False
 
-    async def delete_image(self, filename: str) -> bool:
-        """Delete an image from the TV"""
-        try:
-            # Look up content_id from our mapping
-            content_id = self.file_mapping.get(filename)
-
-            if content_id:
-                logger.info(f"Deleting {filename} from TV {self.tv_ip} (content_id: {content_id})")
-                await self.tv.delete(content_id)
-                # Remove from mapping
-                del self.file_mapping[filename]
-                self._save_mapping()
-                logger.info(f"Successfully deleted {filename} from TV {self.tv_ip}")
-                return True
-            else:
-                logger.warning(f"Could not find {filename} in mapping for TV {self.tv_ip}")
-                return False
-
-        except Exception as e:
-            logger.warning(f"Error deleting {filename} from TV {self.tv_ip}: {e}")
-            return False
-
     async def sync(self, local_images: Set[str] = None) -> bool:
         """Synchronize artwork with the TV"""
         try:
@@ -386,19 +390,27 @@ class TVArtworkSync:
             if local_images is None:
                 local_images = await self.get_local_images()
 
-            # Get TV images
-            tv_images = await self.get_tv_images()
+            # Get TV images (tracked and unknown)
+            tv_images, unknown_images = await self.get_tv_images()
 
             # Determine what to upload and delete
             to_upload = local_images - tv_images
             to_delete = tv_images - local_images
 
-            logger.info(f"TV {self.tv_ip} sync: {len(to_upload)} to upload, {len(to_delete)} to delete")
+            # Handle unknown images based on configuration
+            if unknown_images:
+                if REMOVE_UNKNOWN_IMAGES:
+                    logger.info(f"TV {self.tv_ip}: Found {len(unknown_images)} unknown images, will remove them (REMOVE_UNKNOWN_IMAGES=true)")
+                else:
+                    logger.warning(f"TV {self.tv_ip}: Found {len(unknown_images)} unknown images on TV that are not in the artwork folder. "
+                                 f"Set REMOVE_UNKNOWN_IMAGES=true to remove them. Content IDs: {', '.join(sorted(unknown_images))}")
+
+            logger.info(f"TV {self.tv_ip} sync: {len(to_upload)} to upload, {len(to_delete)} tracked to delete{f', {len(unknown_images)} unknown to delete' if REMOVE_UNKNOWN_IMAGES and unknown_images else ''}")
 
             # Determine slideshow settings (only when images change)
             slideshow_settings = None
 
-            if (to_upload or to_delete) and local_images:
+            if (to_upload or to_delete or (REMOVE_UNKNOWN_IMAGES and unknown_images)) and local_images:
                 # Check if we should use override settings or preserve TV's current settings
                 if SLIDESHOW_OVERRIDE:
                     # Use environment variable override settings
@@ -434,18 +446,47 @@ class TVArtworkSync:
                 # Small delay between uploads to avoid overwhelming the TV
                 await asyncio.sleep(UPLOAD_DELAY)
 
-            # Delete removed images
-            for filename in to_delete:
-                await self.delete_image(filename)
-                await asyncio.sleep(DELETE_DELAY)
+            # Delete removed images (batch delete for efficiency)
+            if to_delete:
+                content_ids_to_delete = [self.file_mapping.get(filename) for filename in to_delete]
+                content_ids_to_delete = [cid for cid in content_ids_to_delete if cid]  # Filter out None values
 
-            # If we made changes and have images, select first image and restart slideshow
-            if local_images and (to_upload or to_delete):
-                first_image_content_id = list(self.file_mapping.values())[0] if self.file_mapping else None
-                if first_image_content_id:
+                if content_ids_to_delete:
+                    logger.info(f"Deleting {len(content_ids_to_delete)} tracked images from TV {self.tv_ip}")
                     try:
-                        logger.info(f"Selecting first image on TV {self.tv_ip} to prevent default art")
-                        await self.tv.select_image(first_image_content_id, show=True)
+                        await self.tv.delete_list(content_ids_to_delete)
+                        # Remove from mapping
+                        for filename in to_delete:
+                            if filename in self.file_mapping:
+                                del self.file_mapping[filename]
+                        self._save_mapping()
+                        logger.info(f"Successfully deleted {len(content_ids_to_delete)} tracked images from TV {self.tv_ip}")
+                    except Exception as e:
+                        logger.warning(f"Error batch deleting tracked images from TV {self.tv_ip}: {e}")
+
+            # Delete unknown images if configured (batch delete for efficiency)
+            if REMOVE_UNKNOWN_IMAGES and unknown_images:
+                logger.info(f"Deleting {len(unknown_images)} unknown images from TV {self.tv_ip}")
+                try:
+                    await self.tv.delete_list(list(unknown_images))
+                    logger.info(f"Successfully deleted {len(unknown_images)} unknown images from TV {self.tv_ip}")
+                except Exception as e:
+                    logger.warning(f"Error batch deleting unknown images from TV {self.tv_ip}: {e}")
+
+            # If we made changes and have images, select an image and restart slideshow
+            if local_images and (to_upload or to_delete or (REMOVE_UNKNOWN_IMAGES and unknown_images)):
+                if self.file_mapping:
+                    try:
+                        # Pick random image if shuffle mode, otherwise pick first
+                        import random
+                        if slideshow_settings and slideshow_settings.get('type') == 'shuffleslideshow':
+                            content_id = random.choice(list(self.file_mapping.values()))
+                            logger.info(f"Selecting random image on TV {self.tv_ip} for shuffle mode")
+                        else:
+                            content_id = list(self.file_mapping.values())[0]
+                            logger.info(f"Selecting first image on TV {self.tv_ip} to prevent default art")
+
+                        await self.tv.select_image(content_id, show=True)
 
                         # Apply slideshow settings (either from override or preserved from TV)
                         if slideshow_settings:

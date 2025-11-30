@@ -72,6 +72,7 @@ All settings are configured via environment variables in [docker-compose.yml](do
 | `LOCATION_TIMEZONE`        | Timezone name (e.g., America/New_York)                                                    | `UTC`     |
 | `BRIGHTNESS_MIN`           | Minimum brightness when sun is below horizon                                              | `2`       |
 | `BRIGHTNESS_MAX`           | Maximum brightness when sun is at zenith (90°)                                            | `10`      |
+| `REMOVE_UNKNOWN_IMAGES`    | Remove images from TV that aren't in the artwork folder (true/false)                      | `false`   |
 
 ### Slideshow & Brightness Control
 
@@ -143,6 +144,22 @@ python sync_artwork.py --test-solar
 This displays hourly brightness levels for key solar positions (March Equinox, June Solstice, December Solstice), helping you verify your settings before deploying.
 
 **Note:** Brightness ranges vary by TV model year. Common ranges are 0-10 or 0-50. Check your TV's settings menu to see which values are supported by your specific model.
+
+### Image Cleanup Control
+
+**`REMOVE_UNKNOWN_IMAGES`** - Controls whether the script removes images from your TV that aren't in your local artwork folder.
+
+**Default behavior (`REMOVE_UNKNOWN_IMAGES=false` or unset):**
+
+- Preserves any images already on the TV that were uploaded manually or before the script started tracking
+- Only manages images that the script has uploaded
+- Logs a warning when unknown images are detected, listing their content IDs
+
+**When enabled (`REMOVE_UNKNOWN_IMAGES=true`):**
+
+- Removes any images from the TV that aren't in your local artwork folder
+- Ensures your TV only displays images from your synced collection
+- Useful for maintaining a "clean slate" that exactly matches your local folder
 
 ## Image Requirements
 
