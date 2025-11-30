@@ -13,8 +13,11 @@ from pathlib import Path
 from typing import List, Set, Dict, Optional, Any
 import time
 import hashlib
+import datetime
+import zoneinfo
 
 from samsungtvws.async_art import SamsungTVAsyncArt
+from pysolar.solar import get_altitude
 
 # Configure logging
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -42,6 +45,18 @@ SLIDESHOW_OVERRIDE = os.getenv('SLIDESHOW_ENABLED') or os.getenv('SLIDESHOW_INTE
 BRIGHTNESS = os.getenv('BRIGHTNESS', '')
 BRIGHTNESS = int(BRIGHTNESS) if BRIGHTNESS else None
 
+# Optional solar-based brightness settings
+SOLAR_BRIGHTNESS_ENABLED = os.getenv('SOLAR_BRIGHTNESS_ENABLED', '').lower() in ('true', '1', 'yes')
+LOCATION_LATITUDE = float(os.getenv('LOCATION_LATITUDE', '0')) if os.getenv('LOCATION_LATITUDE') else None
+LOCATION_LONGITUDE = float(os.getenv('LOCATION_LONGITUDE', '0')) if os.getenv('LOCATION_LONGITUDE') else None
+LOCATION_TIMEZONE = os.getenv('LOCATION_TIMEZONE', 'UTC')
+BRIGHTNESS_MIN = int(os.getenv('BRIGHTNESS_MIN', '2'))
+BRIGHTNESS_MAX = int(os.getenv('BRIGHTNESS_MAX', '10'))
+
+# Validate brightness range
+if BRIGHTNESS_MIN >= BRIGHTNESS_MAX:
+    logger.warning(f"Invalid brightness range: BRIGHTNESS_MIN ({BRIGHTNESS_MIN}) must be less than BRIGHTNESS_MAX ({BRIGHTNESS_MAX}). Solar brightness will not function correctly.")
+
 # Supported image formats
 SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
 
@@ -50,6 +65,85 @@ CONNECTION_TIMEOUT = 10.0
 API_TIMEOUT = 10
 UPLOAD_DELAY = 1.0
 DELETE_DELAY = 0.5
+
+
+def brightness_from_elevation(elevation: float) -> int:
+    """
+    Calculate brightness from sun elevation angle using atmospheric air mass model.
+
+    This uses a physics-based approach that models how sunlight intensity changes
+    as it passes through the atmosphere at different angles. The calculation is
+    based on the air mass coefficient and Kasten-Young atmospheric attenuation formula.
+
+    Args:
+        elevation: Sun elevation angle in degrees (negative = below horizon)
+
+    Returns:
+        Brightness value between BRIGHTNESS_MIN and BRIGHTNESS_MAX
+    """
+    # If sun is at or below horizon, use minimum brightness
+    if elevation <= 0:
+        return BRIGHTNESS_MIN
+
+    # Convert elevation to radians for calculation
+    import math
+    elevation_rad = math.radians(elevation)
+
+    # Calculate air mass (AM) using Kasten-Young formula
+    # This provides accurate results at all sun angles, especially near horizon
+    # At zenith (90°): AM ≈ 1.0 (shortest path)
+    # At 30° elevation: AM ≈ 2.0 (twice the atmosphere)
+    air_mass = 1.0 / (math.sin(elevation_rad) + 0.50572 * (elevation + 6.07995)**(-1.6364))
+
+    # Apply Kasten-Young atmospheric attenuation formula
+    # Relative irradiance = 0.7^(AM^0.678)
+    # This models how atmosphere absorbs/scatters sunlight
+    # 0.7 represents typical clear-sky atmospheric transmittance
+    relative_irradiance = 0.7 ** (air_mass ** 0.678)
+
+    # Map relative irradiance (0.0 to 1.0) to brightness range
+    brightness = BRIGHTNESS_MIN + int((BRIGHTNESS_MAX - BRIGHTNESS_MIN) * relative_irradiance)
+
+    return brightness
+
+
+def calculate_solar_brightness() -> Optional[int]:
+    """
+    Calculate brightness based on current sun position.
+    Returns brightness value (min to max based on sun elevation angle).
+    """
+    if not SOLAR_BRIGHTNESS_ENABLED:
+        return None
+
+    if LOCATION_LATITUDE is None or LOCATION_LONGITUDE is None:
+        logger.warning("Solar brightness enabled but LOCATION_LATITUDE or LOCATION_LONGITUDE not set")
+        return None
+
+    try:
+        # Get current time in the specified timezone
+        tz = zoneinfo.ZoneInfo(LOCATION_TIMEZONE)
+        local_time = datetime.datetime.now(tz)
+        utc_time = local_time.astimezone(datetime.timezone.utc)
+
+        # Calculate sun elevation angle in degrees
+        elevation = get_altitude(LOCATION_LATITUDE, LOCATION_LONGITUDE, utc_time)
+
+        logger.debug(f"Sun elevation at {local_time.strftime('%Y-%m-%d %H:%M %Z')}: {elevation:.2f}°")
+
+        # Calculate brightness from elevation
+        brightness = brightness_from_elevation(elevation)
+
+        if elevation <= 0:
+            logger.info(f"Sun below horizon (elevation: {elevation:.2f}°), using minimum brightness: {brightness}")
+        else:
+            logger.info(f"Sun elevation: {elevation:.2f}° -> brightness: {brightness} "
+                       f"(min: {BRIGHTNESS_MIN}, max: {BRIGHTNESS_MAX})")
+
+        return brightness
+
+    except Exception as e:
+        logger.warning(f"Failed to calculate solar brightness: {e}")
+        return None
 
 
 class TVArtworkSync:
@@ -301,9 +395,8 @@ class TVArtworkSync:
 
             logger.info(f"TV {self.tv_ip} sync: {len(to_upload)} to upload, {len(to_delete)} to delete")
 
-            # If we're going to make changes, determine slideshow/brightness settings to apply
+            # Determine slideshow settings (only when images change)
             slideshow_settings = None
-            brightness_to_apply = None
 
             if (to_upload or to_delete) and local_images:
                 # Check if we should use override settings or preserve TV's current settings
@@ -323,10 +416,16 @@ class TVArtworkSync:
                     # Preserve and restore TV's current slideshow settings
                     slideshow_settings = await self.get_slideshow_settings()
 
-                # Check if brightness override is set
-                if BRIGHTNESS is not None:
-                    brightness_to_apply = BRIGHTNESS
-                    logger.info(f"Using brightness override: {BRIGHTNESS}")
+            # Determine brightness to apply (every sync run, regardless of image changes)
+            brightness_to_apply = None
+
+            # Solar brightness takes precedence over manual brightness
+            solar_brightness = calculate_solar_brightness()
+            if solar_brightness is not None:
+                brightness_to_apply = solar_brightness
+            elif BRIGHTNESS is not None:
+                brightness_to_apply = BRIGHTNESS
+                logger.info(f"Using manual brightness override: {BRIGHTNESS}")
 
             # Upload new images
             for filename in to_upload:
@@ -342,7 +441,6 @@ class TVArtworkSync:
 
             # If we made changes and have images, select first image and restart slideshow
             if local_images and (to_upload or to_delete):
-
                 first_image_content_id = list(self.file_mapping.values())[0] if self.file_mapping else None
                 if first_image_content_id:
                     try:
@@ -353,12 +451,15 @@ class TVArtworkSync:
                         if slideshow_settings:
                             await self.restart_slideshow(slideshow_settings)
 
-                        # Apply brightness setting if specified
-                        if brightness_to_apply is not None:
-                            await self.set_brightness(brightness_to_apply)
-
                     except Exception as e:
                         logger.warning(f"Failed to select image on TV {self.tv_ip}: {e}")
+
+            # Apply brightness every sync run (not just when images change)
+            if brightness_to_apply is not None:
+                try:
+                    await self.set_brightness(brightness_to_apply)
+                except Exception as e:
+                    logger.warning(f"Failed to set brightness on TV {self.tv_ip}: {e}")
 
             logger.info(f"Sync completed for TV {self.tv_ip}")
             return True
@@ -438,6 +539,28 @@ async def main():
 
 
 if __name__ == '__main__':
+    # Check for test mode argument
+    if len(sys.argv) > 1 and sys.argv[1] == '--test-solar':
+        # Run solar brightness test mode
+        if LOCATION_LATITUDE is None or LOCATION_LONGITUDE is None:
+            from solar_test_output import print_test_error
+            print_test_error("Location not configured")
+            sys.exit(1)
+
+        from solar_test_output import run_solar_brightness_test
+
+        # Use the actual brightness calculation function
+        run_solar_brightness_test(
+            LOCATION_LATITUDE,
+            LOCATION_LONGITUDE,
+            LOCATION_TIMEZONE,
+            BRIGHTNESS_MIN,
+            BRIGHTNESS_MAX,
+            brightness_from_elevation
+        )
+        sys.exit(0)
+
+    # Normal operation mode
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
