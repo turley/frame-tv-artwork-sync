@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import List, Set, Dict
+from typing import List, Set, Dict, Optional, Any
 import time
 import hashlib
 
@@ -33,7 +33,7 @@ MATTE_STYLE = os.getenv('MATTE_STYLE', 'none')
 TOKEN_DIR = os.getenv('TOKEN_DIR', '/tokens')
 
 # Supported image formats
-SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
+SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
 
 
 class TVArtworkSync:
@@ -160,6 +160,70 @@ class TVArtworkSync:
             logger.warning(f"Error uploading {file_path.name} to TV {self.tv_ip}: {e}")
             return False
 
+    async def get_slideshow_settings(self) -> Optional[Dict[str, Any]]:
+        """Get current slideshow settings from the TV"""
+        try:
+            logger.debug(f"Checking slideshow settings on TV {self.tv_ip}")
+
+            get_result = await self.tv._send_art_request(
+                {
+                    "request": "get_slideshow_status"
+                },
+                timeout=10
+            )
+
+            if not get_result:
+                logger.debug(f"Could not get slideshow status from TV {self.tv_ip}")
+                return None
+
+            # Parse the current settings
+            current_value = get_result.get('value', 'off')
+            current_type = get_result.get('type', 'shuffleslideshow')
+            current_category = get_result.get('category_id', 'MY-C0002')
+
+            logger.info(f"TV {self.tv_ip} slideshow settings: value={current_value}, type={current_type}, category={current_category}")
+
+            # Return settings only if slideshow is enabled
+            if current_value != 'off' and current_value:
+                return {
+                    'value': current_value,
+                    'type': current_type if current_type else 'shuffleslideshow',
+                    'category_id': current_category if current_category else 'MY-C0002'
+                }
+            else:
+                logger.info(f"Slideshow is disabled on TV {self.tv_ip}")
+                return None
+
+        except Exception as e:
+            logger.debug(f"Could not get slideshow settings from TV {self.tv_ip}: {e}")
+            return None
+
+    async def restart_slideshow(self, settings: Dict[str, Any]) -> bool:
+        """Restart slideshow with given settings"""
+        try:
+            logger.info(f"Restarting slideshow on TV {self.tv_ip} with {settings['value']} minutes")
+
+            set_result = await self.tv._send_art_request(
+                {
+                    "request": "set_slideshow_status",
+                    "value": settings['value'],
+                    "category_id": settings['category_id'],
+                    "type": settings['type']
+                },
+                timeout=10
+            )
+
+            if set_result:
+                logger.info(f"Successfully restarted slideshow on TV {self.tv_ip}")
+                return True
+            else:
+                logger.debug(f"Slideshow restart returned no response on TV {self.tv_ip}")
+                return False
+
+        except Exception as e:
+            logger.debug(f"Could not restart slideshow on TV {self.tv_ip}: {e}")
+            return False
+
     async def delete_image(self, filename: str) -> bool:
         """Delete an image from the TV"""
         try:
@@ -198,6 +262,11 @@ class TVArtworkSync:
 
             logger.info(f"TV {self.tv_ip} sync: {len(to_upload)} to upload, {len(to_delete)} to delete")
 
+            # If we're going to make changes, capture slideshow settings FIRST (before any operations)
+            slideshow_settings = None
+            if (to_upload or to_delete) and local_images:
+                slideshow_settings = await self.get_slideshow_settings()
+
             # Upload new images
             for filename in to_upload:
                 file_path = Path(ARTWORK_DIR) / filename
@@ -210,16 +279,21 @@ class TVArtworkSync:
                 await self.delete_image(filename)
                 await asyncio.sleep(0.5)
 
-            # If we made changes and have images, select the first image to start slideshow
+            # If we made changes and have images, select first image and restart slideshow
             if local_images and (to_upload or to_delete):
+
                 first_image_content_id = list(self.file_mapping.values())[0] if self.file_mapping else None
                 if first_image_content_id:
                     try:
-                        logger.info(f"Starting slideshow on TV {self.tv_ip} with {len(local_images)} images")
-                        # Select the first image to activate the slideshow
+                        logger.info(f"Selecting first image on TV {self.tv_ip} to prevent default art")
                         await self.tv.select_image(first_image_content_id, show=True)
+
+                        # If slideshow was enabled, restart it with the same settings
+                        if slideshow_settings:
+                            await self.restart_slideshow(slideshow_settings)
+
                     except Exception as e:
-                        logger.warning(f"Failed to start slideshow on TV {self.tv_ip}: {e}")
+                        logger.warning(f"Failed to select image on TV {self.tv_ip}: {e}")
 
             logger.info(f"Sync completed for TV {self.tv_ip}")
             return True

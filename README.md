@@ -11,6 +11,7 @@ Automatically sync artwork from a local folder to multiple Samsung Frame TVs usi
 - Auto-cleanup: removes images from TVs when deleted locally
 - Skips offline TVs and continues syncing others
 - Configurable matte/border style
+- Automatic slideshow restoration after sync
 - Lightweight Alpine-based Docker image
 - Persistent file tracking to avoid re-uploading
 
@@ -62,11 +63,17 @@ All settings are configured via environment variables in [docker-compose.yml](do
 | `SYNC_INTERVAL_MINUTES` | How often to sync (in minutes)                         | `5`     |
 | `MATTE_STYLE`           | Border style (see [Matte Styles](#matte-styles) below) | `none`  |
 
-**Note:** Slideshow interval and brightness must be configured manually via the SmartThings app or TV settings.
+**Note:** Slideshow interval and brightness must be configured manually via the SmartThings app or TV settings. The sync script will automatically preserve and restore your slideshow settings after syncing new images.
 
-## Supported Image Formats
+## Image Requirements
 
-JPG, JPEG, PNG, BMP, TIF, TIFF
+**Supported Formats:** JPEG, JPG, PNG
+
+**Recommended Specs:**
+- Resolution: 3840 x 2160 pixels (4K) for 43"+ TVs, 1920 x 1080 for 32" TVs
+- Aspect ratio: 16:9
+- File size: Under 20MB
+- Color space: sRGB
 
 ## Matte Styles
 
@@ -115,9 +122,22 @@ export $(grep -v '^#' .env | xargs) && python sync_artwork.py
 
 On first run, approve the connection on your TV. Press `Ctrl+C` to stop.
 
-## Logs
+## How It Works
 
-View logs to monitor sync status:
+### Slideshow Restoration
+
+When the sync script uploads new images or deletes old ones, it automatically:
+
+1. **Captures** your current slideshow settings before making changes
+2. **Syncs** the artwork (uploads new, deletes removed)
+3. **Selects** the first image to prevent the TV from showing default art
+4. **Restores** your slideshow settings so rotation continues automatically
+
+This ensures your slideshow keeps running seamlessly after each sync.
+
+### Debug Logging
+
+Set `LOG_LEVEL=DEBUG` in your environment to see detailed sync operations:
 
 ```bash
 docker-compose logs -f
