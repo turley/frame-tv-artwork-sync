@@ -35,6 +35,12 @@ TOKEN_DIR = os.getenv('TOKEN_DIR', '/tokens')
 # Supported image formats
 SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
 
+# Timeout and delay constants (in seconds)
+CONNECTION_TIMEOUT = 10.0
+API_TIMEOUT = 10
+UPLOAD_DELAY = 1.0
+DELETE_DELAY = 0.5
+
 
 class TVArtworkSync:
     """Manages artwork synchronization for a Samsung Frame TV"""
@@ -74,10 +80,12 @@ class TVArtworkSync:
             # Ensure token directory exists
             self.token_file.parent.mkdir(parents=True, exist_ok=True)
 
+            # Create TV connection with timeout parameter
             self.tv = SamsungTVAsyncArt(
                 host=self.tv_ip,
                 port=8002,
-                token_file=str(self.token_file)
+                token_file=str(self.token_file),
+                timeout=CONNECTION_TIMEOUT
             )
 
             # Test connection by getting available art
@@ -85,6 +93,9 @@ class TVArtworkSync:
             logger.info(f"Successfully connected to TV at {self.tv_ip}")
             return True
 
+        except asyncio.TimeoutError:
+            logger.warning(f"Connection to TV at {self.tv_ip} timed out (TV may be off)")
+            return False
         except Exception as e:
             logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
             return False
@@ -169,7 +180,7 @@ class TVArtworkSync:
                 {
                     "request": "get_slideshow_status"
                 },
-                timeout=10
+                timeout=API_TIMEOUT
             )
 
             if not get_result:
@@ -210,7 +221,7 @@ class TVArtworkSync:
                     "category_id": settings['category_id'],
                     "type": settings['type']
                 },
-                timeout=10
+                timeout=API_TIMEOUT
             )
 
             if set_result:
@@ -272,12 +283,12 @@ class TVArtworkSync:
                 file_path = Path(ARTWORK_DIR) / filename
                 await self.upload_image(file_path)
                 # Small delay between uploads to avoid overwhelming the TV
-                await asyncio.sleep(1)
+                await asyncio.sleep(UPLOAD_DELAY)
 
             # Delete removed images
             for filename in to_delete:
                 await self.delete_image(filename)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(DELETE_DELAY)
 
             # If we made changes and have images, select first image and restart slideshow
             if local_images and (to_upload or to_delete):
