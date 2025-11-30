@@ -11,8 +11,9 @@ RUN apk add --no-cache git
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy sync script
+# Copy sync scripts
 COPY sync_artwork.py .
+COPY solar_test_output.py .
 
 # Create directories for artwork and tokens
 RUN mkdir -p /artwork /tokens

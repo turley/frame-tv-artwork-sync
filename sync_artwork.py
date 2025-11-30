@@ -56,9 +56,13 @@ BRIGHTNESS_MAX = int(os.getenv('BRIGHTNESS_MAX', '10'))
 # Optional cleanup setting
 REMOVE_UNKNOWN_IMAGES = os.getenv('REMOVE_UNKNOWN_IMAGES', '').lower() in ('true', '1', 'yes')
 
+# Dry run mode (set by command line argument)
+DRY_RUN = False
+
 # Validate brightness range
 if BRIGHTNESS_MIN >= BRIGHTNESS_MAX:
-    logger.warning(f"Invalid brightness range: BRIGHTNESS_MIN ({BRIGHTNESS_MIN}) must be less than BRIGHTNESS_MAX ({BRIGHTNESS_MAX}). Solar brightness will not function correctly.")
+    logger.error(f"Invalid brightness range: BRIGHTNESS_MIN ({BRIGHTNESS_MIN}) must be less than BRIGHTNESS_MAX ({BRIGHTNESS_MAX}).")
+    sys.exit(1)
 
 # Supported image formats
 SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
@@ -68,7 +72,7 @@ CONNECTION_TIMEOUT = 10.0
 API_TIMEOUT = 10
 UPLOAD_DELAY = 1.0
 DELETE_DELAY = 0.5
-UPLOAD_RETRY_ATTEMPTS = 2
+UPLOAD_ATTEMPTS = 2
 
 
 def brightness_from_elevation(elevation: float) -> int:
@@ -153,7 +157,7 @@ def calculate_solar_brightness() -> Optional[int]:
 class TVArtworkSync:
     """Manages artwork synchronization for a Samsung Frame TV"""
 
-    def __init__(self, tv_ip: str):
+    def __init__(self, tv_ip: str) -> None:
         self.tv_ip = tv_ip
         self.tv = None
         self.token_file = Path(TOKEN_DIR) / f'tv_{tv_ip.replace(".", "_")}.txt'
@@ -161,7 +165,7 @@ class TVArtworkSync:
         self.file_mapping: Dict[str, str] = {}  # filename -> content_id mapping
         self._load_mapping()
 
-    def _load_mapping(self):
+    def _load_mapping(self) -> None:
         """Load filename to content_id mapping from disk"""
         if self.mapping_file.exists():
             try:
@@ -172,7 +176,7 @@ class TVArtworkSync:
                 logger.warning(f"Failed to load mapping file: {e}")
                 self.file_mapping = {}
 
-    def _save_mapping(self):
+    def _save_mapping(self) -> None:
         """Save filename to content_id mapping to disk"""
         try:
             self.mapping_file.parent.mkdir(parents=True, exist_ok=True)
@@ -267,10 +271,14 @@ class TVArtworkSync:
 
     async def upload_image(self, file_path: Path) -> bool:
         """Upload a single image to the TV with retry logic"""
-        for attempt in range(UPLOAD_RETRY_ATTEMPTS):
+        if DRY_RUN:
+            logger.info(f"[DRY RUN] Would upload {file_path.name} to TV {self.tv_ip}")
+            return True
+
+        for attempt in range(UPLOAD_ATTEMPTS):
             try:
                 if attempt > 0:
-                    logger.info(f"Retrying upload of {file_path.name} to TV {self.tv_ip} (attempt {attempt + 1}/{UPLOAD_RETRY_ATTEMPTS})")
+                    logger.info(f"Retrying upload of {file_path.name} to TV {self.tv_ip} (attempt {attempt + 1}/{UPLOAD_ATTEMPTS})")
                 else:
                     logger.info(f"Uploading {file_path.name} to TV {self.tv_ip}")
 
@@ -288,17 +296,17 @@ class TVArtworkSync:
                     return True
                 else:
                     logger.warning(f"Upload returned no content_id for {file_path.name} to TV {self.tv_ip}")
-                    if attempt < UPLOAD_RETRY_ATTEMPTS - 1:
+                    if attempt < UPLOAD_ATTEMPTS - 1:
                         await asyncio.sleep(UPLOAD_DELAY)
                     continue
 
             except Exception as e:
                 logger.warning(f"Error uploading {file_path.name} to TV {self.tv_ip}: {e}")
-                if attempt < UPLOAD_RETRY_ATTEMPTS - 1:
+                if attempt < UPLOAD_ATTEMPTS - 1:
                     await asyncio.sleep(UPLOAD_DELAY)
                 continue
 
-        logger.warning(f"Failed to upload {file_path.name} to TV {self.tv_ip} after {UPLOAD_RETRY_ATTEMPTS} attempts")
+        logger.warning(f"Failed to upload {file_path.name} to TV {self.tv_ip} after {UPLOAD_ATTEMPTS} attempts")
         return False
 
     async def get_slideshow_settings(self) -> Optional[Dict[str, Any]]:
@@ -341,6 +349,10 @@ class TVArtworkSync:
 
     async def restart_slideshow(self, settings: Dict[str, Any]) -> bool:
         """Restart slideshow with given settings"""
+        if DRY_RUN:
+            logger.info(f"[DRY RUN] Would restart slideshow on TV {self.tv_ip} with {settings['value']} minutes")
+            return True
+
         try:
             logger.info(f"Restarting slideshow on TV {self.tv_ip} with {settings['value']} minutes")
 
@@ -367,6 +379,10 @@ class TVArtworkSync:
 
     async def set_brightness(self, brightness: int) -> bool:
         """Set brightness on the TV (0-50 range)"""
+        if DRY_RUN:
+            logger.info(f"[DRY RUN] Would set brightness to {brightness} on TV {self.tv_ip}")
+            return True
+
         try:
             logger.info(f"Setting brightness to {brightness} on TV {self.tv_ip}")
 
@@ -452,26 +468,32 @@ class TVArtworkSync:
                 content_ids_to_delete = [cid for cid in content_ids_to_delete if cid]  # Filter out None values
 
                 if content_ids_to_delete:
-                    logger.info(f"Deleting {len(content_ids_to_delete)} tracked images from TV {self.tv_ip}")
-                    try:
-                        await self.tv.delete_list(content_ids_to_delete)
-                        # Remove from mapping
-                        for filename in to_delete:
-                            if filename in self.file_mapping:
-                                del self.file_mapping[filename]
-                        self._save_mapping()
-                        logger.info(f"Successfully deleted {len(content_ids_to_delete)} tracked images from TV {self.tv_ip}")
-                    except Exception as e:
-                        logger.warning(f"Error batch deleting tracked images from TV {self.tv_ip}: {e}")
+                    if DRY_RUN:
+                        logger.info(f"[DRY RUN] Would delete {len(content_ids_to_delete)} tracked images from TV {self.tv_ip}: {', '.join(to_delete)}")
+                    else:
+                        logger.info(f"Deleting {len(content_ids_to_delete)} tracked images from TV {self.tv_ip}")
+                        try:
+                            await self.tv.delete_list(content_ids_to_delete)
+                            # Remove from mapping
+                            for filename in to_delete:
+                                if filename in self.file_mapping:
+                                    del self.file_mapping[filename]
+                            self._save_mapping()
+                            logger.info(f"Successfully deleted {len(content_ids_to_delete)} tracked images from TV {self.tv_ip}")
+                        except Exception as e:
+                            logger.warning(f"Error batch deleting tracked images from TV {self.tv_ip}: {e}")
 
             # Delete unknown images if configured (batch delete for efficiency)
             if REMOVE_UNKNOWN_IMAGES and unknown_images:
-                logger.info(f"Deleting {len(unknown_images)} unknown images from TV {self.tv_ip}")
-                try:
-                    await self.tv.delete_list(list(unknown_images))
-                    logger.info(f"Successfully deleted {len(unknown_images)} unknown images from TV {self.tv_ip}")
-                except Exception as e:
-                    logger.warning(f"Error batch deleting unknown images from TV {self.tv_ip}: {e}")
+                if DRY_RUN:
+                    logger.info(f"[DRY RUN] Would delete {len(unknown_images)} unknown images from TV {self.tv_ip}")
+                else:
+                    logger.info(f"Deleting {len(unknown_images)} unknown images from TV {self.tv_ip}")
+                    try:
+                        await self.tv.delete_list(list(unknown_images))
+                        logger.info(f"Successfully deleted {len(unknown_images)} unknown images from TV {self.tv_ip}")
+                    except Exception as e:
+                        logger.warning(f"Error batch deleting unknown images from TV {self.tv_ip}: {e}")
 
             # If we made changes and have images, select an image and restart slideshow
             if local_images and (to_upload or to_delete or (REMOVE_UNKNOWN_IMAGES and unknown_images)):
@@ -481,12 +503,19 @@ class TVArtworkSync:
                         import random
                         if slideshow_settings and slideshow_settings.get('type') == 'shuffleslideshow':
                             content_id = random.choice(list(self.file_mapping.values()))
-                            logger.info(f"Selecting random image on TV {self.tv_ip} for shuffle mode")
+                            if DRY_RUN:
+                                logger.info(f"[DRY RUN] Would select random image on TV {self.tv_ip} for shuffle mode")
+                            else:
+                                logger.info(f"Selecting random image on TV {self.tv_ip} for shuffle mode")
                         else:
                             content_id = list(self.file_mapping.values())[0]
-                            logger.info(f"Selecting first image on TV {self.tv_ip} to prevent default art")
+                            if DRY_RUN:
+                                logger.info(f"[DRY RUN] Would select first image on TV {self.tv_ip} to prevent default art")
+                            else:
+                                logger.info(f"Selecting first image on TV {self.tv_ip} to prevent default art")
 
-                        await self.tv.select_image(content_id, show=True)
+                        if not DRY_RUN:
+                            await self.tv.select_image(content_id, show=True)
 
                         # Apply slideshow settings (either from override or preserved from TV)
                         if slideshow_settings:
@@ -509,16 +538,16 @@ class TVArtworkSync:
             logger.warning(f"Error during sync for TV {self.tv_ip}: {e}")
             return False
 
-    async def close(self):
+    async def close(self) -> None:
         """Close connection to TV"""
         if self.tv:
             try:
                 await self.tv.close()
-            except:
+            except Exception:
                 pass
 
 
-async def sync_all_tvs():
+async def sync_all_tvs() -> None:
     """Synchronize artwork to all configured TVs"""
     if not TV_IPS:
         logger.error("No TV IPs configured. Set TV_IPS environment variable.")
@@ -552,7 +581,7 @@ async def sync_all_tvs():
     logger.info("Sync cycle completed")
 
 
-async def main():
+async def main() -> None:
     """Main loop - sync periodically"""
     logger.info("=" * 60)
     logger.info("Samsung Frame TV Artwork Sync Service")
@@ -580,26 +609,33 @@ async def main():
 
 
 if __name__ == '__main__':
-    # Check for test mode argument
-    if len(sys.argv) > 1 and sys.argv[1] == '--test-solar':
-        # Run solar brightness test mode
-        if LOCATION_LATITUDE is None or LOCATION_LONGITUDE is None:
-            from solar_test_output import print_test_error
-            print_test_error("Location not configured")
-            sys.exit(1)
+    # Check for command-line arguments
+    if len(sys.argv) > 1:
+        if sys.argv[1] == '--test-solar':
+            # Run solar brightness test mode
+            if LOCATION_LATITUDE is None or LOCATION_LONGITUDE is None:
+                from solar_test_output import print_test_error
+                print_test_error("Location not configured")
+                sys.exit(1)
 
-        from solar_test_output import run_solar_brightness_test
+            from solar_test_output import run_solar_brightness_test
 
-        # Use the actual brightness calculation function
-        run_solar_brightness_test(
-            LOCATION_LATITUDE,
-            LOCATION_LONGITUDE,
-            LOCATION_TIMEZONE,
-            BRIGHTNESS_MIN,
-            BRIGHTNESS_MAX,
-            brightness_from_elevation
-        )
-        sys.exit(0)
+            # Use the actual brightness calculation function
+            run_solar_brightness_test(
+                LOCATION_LATITUDE,
+                LOCATION_LONGITUDE,
+                LOCATION_TIMEZONE,
+                BRIGHTNESS_MIN,
+                BRIGHTNESS_MAX,
+                brightness_from_elevation
+            )
+            sys.exit(0)
+        elif sys.argv[1] == '--dry-run':
+            # Enable dry run mode
+            DRY_RUN = True
+            logger.info("=" * 60)
+            logger.info("DRY RUN MODE - No changes will be made to TVs")
+            logger.info("=" * 60)
 
     # Normal operation mode
     try:

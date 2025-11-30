@@ -44,7 +44,6 @@ mkdir -p artwork tokens
 docker run -d \
   --name frame-tv-sync \
   --restart unless-stopped \
-  --network host \
   -e TV_IPS="192.168.1.100,192.168.1.101" \
   -e SYNC_INTERVAL_MINUTES="5" \
   -e MATTE_STYLE="none" \
@@ -229,18 +228,29 @@ export $(grep -v '^#' .env | xargs) && python sync_artwork.py --test-solar
 
 This shows hourly brightness predictions for key solar positions (March Equinox, June Solstice, December Solstice) without connecting to TVs.
 
+**Dry run mode:**
+
+Preview what changes would be made without actually modifying your TVs:
+
+```bash
+export $(grep -v '^#' .env | xargs) && python sync_artwork.py --dry-run
+```
+
+This connects to TVs to read their current state but won't upload, delete, or modify any settings.
+
 ## How It Works
 
-### Slideshow Restoration
+### Slideshow Behavior
 
-When the sync script uploads new images or deletes old ones, it automatically:
+When the sync script uploads new images or deletes old ones:
 
-1. **Captures** your current slideshow settings before making changes
-2. **Syncs** the artwork (uploads new, deletes removed)
-3. **Selects** the first image to prevent the TV from showing default art
-4. **Restores** your slideshow settings so rotation continues automatically
+1. **Syncs** the artwork (uploads new, deletes removed)
+2. **Selects** an image to prevent the TV from showing default art (random image for shuffle mode, first image otherwise)
+3. **Applies slideshow settings** based on your configuration:
+   - If slideshow override variables are set (`SLIDESHOW_ENABLED`, `SLIDESHOW_INTERVAL`, or `SLIDESHOW_TYPE`), uses those settings
+   - If no override variables are set, preserves and restores your TV's current slideshow settings
 
-This ensures your slideshow keeps running seamlessly after each sync.
+If no images change during a sync cycle, slideshow settings are not modified.
 
 ### Debug Logging
 
@@ -253,7 +263,7 @@ docker-compose logs -f
 ## Requirements
 
 - Samsung Frame TV (2016+ models with Tizen OS)
-- Docker and Docker Compose
+- Docker and Docker Compose (or Python 3.9+ for local testing)
 - Network access to TVs
 
 ## Credits
