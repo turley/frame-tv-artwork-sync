@@ -1,36 +1,37 @@
 # Samsung Frame TV Artwork Sync
 
-Automatically sync artwork from a local folder to multiple Samsung Frame TVs using Docker.
+Automatically sync artwork from a local folder to Samsung Frame TVs using Docker.
 
 **Docker Hub:** [turley/frame-tv-artwork-sync](https://hub.docker.com/r/turley/frame-tv-artwork-sync)
 
 ## Features
 
-- Sync artwork to multiple Frame TVs simultaneously
+- Sync artwork to one or multiple Frame TVs
 - Automatic periodic sync (configurable interval)
 - Auto-cleanup: removes images from TVs when deleted locally
-- Skips offline TVs and continues syncing others
-- Configurable matte/border style
-- Automatic slideshow restoration after sync
-- Lightweight Alpine-based Docker image
 - Persistent file tracking to avoid re-uploading
+- Configurable matte/border style
+- Slideshow control: preserve TV settings or override with custom interval/type
+- Optional solar-based brightness adjustment using sun position and atmospheric modeling
+- Manual brightness control with fixed values
+- Skips offline TVs and continues syncing others
+- Lightweight Alpine-based Docker image
 
 ## Quick Start
 
 ### Using Docker Compose (Recommended)
 
 1. Download [docker-compose.yml](docker-compose.yml)
-2. Create folders and add your images:
+2. Create folders:
    ```bash
    mkdir -p artwork tokens
-   # Add your images to the artwork folder
    ```
-3. Edit `docker-compose.yml` with your TV IP addresses
-4. Run:
-
-```bash
-docker-compose up -d
-```
+3. Add your images to the artwork folder
+4. Edit `docker-compose.yml` with your TV IP addresses
+5. Run:
+   ```bash
+   docker-compose up -d
+   ```
 
 On first run, approve the connection on each TV when prompted. Tokens are saved for future use.
 
@@ -46,7 +47,6 @@ docker run -d \
   --restart unless-stopped \
   -e TV_IPS="192.168.1.100,192.168.1.101" \
   -e SYNC_INTERVAL_MINUTES="5" \
-  -e MATTE_STYLE="none" \
   -v ./artwork:/artwork \
   -v ./tokens:/tokens \
   turley/frame-tv-artwork-sync
@@ -54,7 +54,7 @@ docker run -d \
 
 ## Configuration
 
-All settings are configured via environment variables in [docker-compose.yml](docker-compose.yml):
+All settings are configured via environment variables:
 
 | Variable                   | Description                                                                               | Default   |
 | -------------------------- | ----------------------------------------------------------------------------------------- | --------- |
@@ -63,14 +63,14 @@ All settings are configured via environment variables in [docker-compose.yml](do
 | `MATTE_STYLE`              | Border style (see [Matte Styles](#matte-styles) below)                                    | `none`    |
 | `SLIDESHOW_ENABLED`        | Enable slideshow (true/false) - overrides TV settings if set                              | (unset)   |
 | `SLIDESHOW_INTERVAL`       | Slideshow interval in minutes (use values supported by your TV model)                     | `15`      |
-| `SLIDESHOW_TYPE`           | Slideshow type: `shuffle` or `sequential` - requires override enabled                     | `shuffle` |
+| `SLIDESHOW_TYPE`           | Slideshow type: `shuffle` or `sequential`                                                 | `shuffle` |
 | `BRIGHTNESS`               | Manual brightness override (use values supported by your TV model, commonly 0-10 or 0-50) | (unset)   |
 | `SOLAR_BRIGHTNESS_ENABLED` | Enable automatic solar-based brightness adjustment (true/false)                           | (unset)   |
 | `LOCATION_LATITUDE`        | Latitude for solar calculations (e.g., 42.3601)                                           | -         |
 | `LOCATION_LONGITUDE`       | Longitude for solar calculations (e.g., -71.0589)                                         | -         |
 | `LOCATION_TIMEZONE`        | Timezone name (e.g., America/New_York)                                                    | `UTC`     |
 | `BRIGHTNESS_MIN`           | Minimum brightness when sun is below horizon                                              | `2`       |
-| `BRIGHTNESS_MAX`           | Maximum brightness when sun is at zenith (90°)                                            | `10`      |
+| `BRIGHTNESS_MAX`           | Maximum brightness if sun were at zenith (90°)                                            | `10`      |
 | `REMOVE_UNKNOWN_IMAGES`    | Remove images from TV that aren't in the artwork folder (true/false)                      | `false`   |
 
 ### Slideshow & Brightness Control
@@ -101,7 +101,7 @@ All settings are configured via environment variables in [docker-compose.yml](do
 
 - Enable `SOLAR_BRIGHTNESS_ENABLED=true` to automatically adjust brightness based on sun position
 - Requires `LOCATION_LATITUDE`, `LOCATION_LONGITUDE`, and `LOCATION_TIMEZONE`
-- Set `BRIGHTNESS_MIN` (brightness when sun is below horizon) and `BRIGHTNESS_MAX` (brightness at maximum solar irradiance)
+- Set `BRIGHTNESS_MIN` (brightness when sun is below horizon) and `BRIGHTNESS_MAX` (brightness for sun at zenith)
 - Brightness is calculated every sync run using physics-based atmospheric air mass model
 - Uses Kasten-Young formula to model how sunlight intensity changes through the atmosphere
 - Takes precedence over manual `BRIGHTNESS` setting when enabled
@@ -141,8 +141,6 @@ python sync_artwork.py --test-solar
 ```
 
 This displays hourly brightness levels for key solar positions (March Equinox, June Solstice, December Solstice), helping you verify your settings before deploying.
-
-**Note:** Brightness ranges vary by TV model year. Common ranges are 0-10 or 0-50. Check your TV's settings menu to see which values are supported by your specific model.
 
 ### Image Cleanup Control
 
@@ -252,19 +250,17 @@ When the sync script uploads new images or deletes old ones:
 
 If no images change during a sync cycle, slideshow settings are not modified.
 
-### Debug Logging
-
-Set `LOG_LEVEL=DEBUG` in your environment to see detailed sync operations:
-
-```bash
-docker-compose logs -f
-```
-
 ## Requirements
 
 - Samsung Frame TV (2016+ models with Tizen OS)
 - Docker and Docker Compose (or Python 3.9+ for local testing)
 - Network access to TVs
+
+## Troubleshooting
+
+### Debug Logging
+
+Set `LOG_LEVEL=DEBUG` in your environment to see detailed sync operations and TV responses.
 
 ## Credits
 
