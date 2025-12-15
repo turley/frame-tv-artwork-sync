@@ -15,6 +15,7 @@ Automatically sync artwork from a local folder to Samsung Frame TVs using Docker
 - Optional solar-based brightness adjustment using sun position and atmospheric modeling
 - Manual brightness control with fixed values
 - Skips offline TVs and continues syncing others
+- Skips TVs not in art mode (e.g., when watching content via HDMI)
 - Lightweight Alpine-based Docker image
 
 ## Quick Start

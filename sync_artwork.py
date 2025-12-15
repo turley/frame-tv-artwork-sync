@@ -212,6 +212,29 @@ class TVArtworkSync:
             logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
             return False
 
+    async def is_in_art_mode(self) -> bool:
+        """Check if the TV is currently in art mode (not being used for other content)"""
+        try:
+            # First check if TV is on
+            is_on = await self.tv.on()
+            if not is_on:
+                # TV is off - safe to skip (will be synced when it turns on)
+                logger.debug(f"TV {self.tv_ip} is powered off")
+                return False
+
+            # Check if TV is in art mode
+            art_mode_status = await self.tv.get_artmode()
+            is_art_mode = art_mode_status == 'on'
+
+            logger.debug(f"TV {self.tv_ip} art mode status: {art_mode_status}")
+            return is_art_mode
+
+        except Exception as e:
+            logger.debug(f"Could not determine art mode status for TV {self.tv_ip}: {e}")
+            # If we can't determine the state, assume it's safe to sync
+            # (this preserves backward-compatible behavior)
+            return True
+
     async def get_local_images(self) -> Set[str]:
         """Get list of image files from local directory"""
         local_files = set()
@@ -568,12 +591,26 @@ async def sync_all_tvs() -> None:
         logger.warning("No TVs are currently available")
         return
 
-    # Get local images once (shared by all TVs)
-    logger.info(f"Syncing {len(connected_tvs)} connected TV(s)")
-    local_images = await connected_tvs[0].get_local_images() if connected_tvs else set()
+    # Filter out TVs that are not in art mode (e.g., watching HDMI content)
+    tvs_to_sync = []
+    for tv_sync in connected_tvs:
+        if await tv_sync.is_in_art_mode():
+            tvs_to_sync.append(tv_sync)
+        else:
+            logger.info(f"Skipping TV {tv_sync.tv_ip} - not in art mode (may be in use)")
 
-    # Sync all connected TVs with the same local images
-    await asyncio.gather(*[tv.sync(local_images) for tv in connected_tvs])
+    if not tvs_to_sync:
+        logger.info("No TVs in art mode to sync")
+        # Close all connections
+        await asyncio.gather(*[tv.close() for tv in tv_syncs])
+        return
+
+    # Get local images once (shared by all TVs)
+    logger.info(f"Syncing {len(tvs_to_sync)} TV(s) in art mode")
+    local_images = await tvs_to_sync[0].get_local_images() if tvs_to_sync else set()
+
+    # Sync all TVs that are in art mode with the same local images
+    await asyncio.gather(*[tv.sync(local_images) for tv in tvs_to_sync])
 
     # Close all connections
     await asyncio.gather(*[tv.close() for tv in tv_syncs])
