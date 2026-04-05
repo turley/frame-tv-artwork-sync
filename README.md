@@ -4,6 +4,14 @@ Automatically sync artwork from a local folder to Samsung Frame TVs using Docker
 
 **Docker Hub:** [turley/frame-tv-artwork-sync](https://hub.docker.com/r/turley/frame-tv-artwork-sync)
 
+## New! 2024 Model Support
+
+This project has been updated to fully support **2024 Samsung Frame TVs (LS03D)** and newer firmware (v2.0.25+) while maintaining **100% backward compatibility** with older models. Key features include:
+
+- **Smart Connect (Auto-Fallback)**: Automatically detects if your TV requires legacy Port 8001 or modern Port 8002 with SSL. No configuration required for most setups!
+- **Wake-on-LAN**: Automatically wake sleeping TVs before syncing using their MAC address.
+- **System Insight**: Automatically logs your TV's Model and Firmware version during the sync cycle for easier troubleshooting.
+
 ## Features
 
 - Sync artwork to one or multiple Frame TVs
@@ -61,6 +69,10 @@ All settings are configured via environment variables:
 | -------------------------- | ----------------------------------------------------------------------------------------- | --------- |
 | `TV_IPS`                   | Comma-separated TV IP addresses (required)                                                | -         |
 | `SYNC_INTERVAL_MINUTES`    | How often to sync (in minutes)                                                            | `5`       |
+| `TV_PORT`                  | Preferred connection port (8001=legacy, 8002=modern). Script auto-falls back if needed. | `8001`    |
+| `TV_SSL`                   | Use SSL/TLS for secure connections. Script auto-detects if required.                      | `false`   |
+| `TV_NAME`                  | App name used for the handshake request                                                   | `Samsung TV` |
+| `TV_MAC`                   | TV MAC Address for Wake-on-LAN and connection stability                                   | (unset)   |
 | `MATTE_STYLE`              | Border style (see [Matte Styles](#matte-styles) below)                                    | `none`    |
 | `SLIDESHOW_ENABLED`        | Enable slideshow (true/false) - overrides TV settings if set                              | (unset)   |
 | `SLIDESHOW_INTERVAL`       | Slideshow interval in minutes (use values supported by your TV model)                     | `15`      |
@@ -75,6 +87,10 @@ All settings are configured via environment variables:
 | `REMOVE_UNKNOWN_IMAGES`    | Remove images from TV that aren't in the artwork folder (true/false)                      | `false`   |
 | `AUTO_OFF_TIME`            | Time to turn off TVs in art mode (24-hour format, e.g., `22:00`)                          | (unset)   |
 | `AUTO_OFF_GRACE_HOURS`     | Hours after `AUTO_OFF_TIME` to keep trying to turn off TVs                                | `2`       |
+| `TV_PORT`                  | Secure WebSocket port (set `8002` for 2024+ models)                                       | `8002`    |
+| `TV_SSL`                   | Use SSL/TLS for secure connections (required for 2024+ models)                            | `true`    |
+| `TV_NAME`                  | App name used for the handshake request                                                   | `Samsung TV` |
+| `TV_MAC`                   | TV MAC Address for Wake-on-LAN and connection stability                                   | (unset)   |
 
 ### Slideshow & Brightness Control
 
@@ -295,11 +311,22 @@ If no images change during a sync cycle, slideshow settings are not modified.
 - Docker and Docker Compose (or Python 3.9+ for local testing)
 - Network access to TVs
 
-## Troubleshooting
-
 ### Debug Logging
 
 Set `LOG_LEVEL=DEBUG` in your environment to see detailed sync operations and TV responses.
+
+### 2024 Models & Firmware Updates (v2.0.25+)
+
+Recent Samsung Frame TV firmware (notably on 2024 models) has increased security requirements. This script now includes **Smart Connect** which automatically handles these changes, but you can manually tune it if needed:
+
+1.  **Auto-Fallback**:
+    By default, the script tries Port 8001. If it detect a modern TV requiring security, it will automatically switch to **Port 8002** and **SSL**.
+2.  **Use TV_MAC (Wake-on-LAN)**:
+    Set your TV's MAC address in `TV_MAC` (e.g., `20:15:DE:31:D9:40`). This allows the script to send a "Magic Packet" to wake up the TV's network port if it's in a deep sleep. 
+3.  **Renaming the app**:
+    If your TV is ignoring the connection request, set `TV_NAME` to a unique value like `FrameSync` to trigger a fresh "Allow" prompt.
+4.  **Clear the Device List**:
+    If no popup appears, go to **Settings > Connection > External Device Manager > Device Connection Manager > Device List** on your TV and delete any existing entry for "Samsung TV" or "python" before restarting the container.
 
 ## Credits
 

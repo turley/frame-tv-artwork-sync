@@ -39,6 +39,12 @@ SYNC_INTERVAL_MINUTES = int(os.getenv('SYNC_INTERVAL_MINUTES', '5'))
 MATTE_STYLE = os.getenv('MATTE_STYLE', 'none')
 TOKEN_DIR = os.getenv('TOKEN_DIR', '/tokens')
 
+# Connection settings (Auto-detecting legacy 8001 vs modern 8002/SSL)
+TV_PORT = int(os.getenv('TV_PORT', '8001'))
+TV_SSL = os.getenv('TV_SSL', 'false').lower() in ('true', '1', 'yes')
+TV_NAME = os.getenv('TV_NAME', 'Samsung TV')
+TV_MAC = os.getenv('TV_MAC', '')  # Optional: used for Wake-on-LAN
+
 # Optional slideshow override settings (if any are set, all are used with defaults)
 SLIDESHOW_ENABLED = os.getenv('SLIDESHOW_ENABLED', '').lower() in ('true', '1', 'yes')
 SLIDESHOW_INTERVAL = int(os.getenv('SLIDESHOW_INTERVAL', '15'))
@@ -231,6 +237,10 @@ class TVArtworkSync:
         self.token_file = Path(TOKEN_DIR) / f'tv_{tv_ip.replace(".", "_")}.txt'
         self.mapping_file = Path(TOKEN_DIR) / f'tv_{tv_ip.replace(".", "_")}_mapping.json'
         self.file_mapping: Dict[str, str] = {}  # filename -> content_id mapping
+        self.model = "Unknown"
+        self.version = "Unknown"
+        self.active_port = TV_PORT
+        self.active_ssl = TV_SSL
         self._load_mapping()
 
     def _load_mapping(self) -> None:
@@ -255,27 +265,106 @@ class TVArtworkSync:
             logger.warning(f"Failed to save mapping file: {e}")
 
     async def connect(self) -> bool:
-        """Connect to the TV"""
+        """Connect to the TV with automatic port/SSL fallback"""
         try:
             # Ensure token directory exists
             self.token_file.parent.mkdir(parents=True, exist_ok=True)
 
-            # Create TV connection with timeout parameter
+            # --- Primary Connection Attempt ---
+            connected = await self._try_connect(self.active_port, self.active_ssl)
+            if connected:
+                return True
+
+            # --- Automatic Fallback Logic (Maintain backward compatibility) ---
+            # If default port failed and we haven't already tried the 'other' common port
+            if self.active_port == 8001:
+                logger.info(f"Port 8001 connection failed for {self.tv_ip}. Attempting secure Port 8002/SSL fallback...")
+                connected = await self._try_connect(8002, True)
+                if connected:
+                    self.active_port, self.active_ssl = 8002, True
+                    return True
+            elif self.active_port == 8002:
+                logger.info(f"Port 8002 connection failed for {self.tv_ip}. Attempting legacy Port 8001 fallback...")
+                connected = await self._try_connect(8001, False)
+                if connected:
+                    self.active_port, self.active_ssl = 8001, False
+                    return True
+
+            # --- Wake-on-LAN Fallback ---
+            if TV_MAC:
+                logger.info(f"All standard ports failed for {self.tv_ip}. Attempting Wake-on-LAN using {TV_MAC}...")
+                await self._wake_on_lan()
+                await asyncio.sleep(5)
+                # Retry current best guess
+                if await self._try_connect(self.active_port, self.active_ssl):
+                    return True
+
+            logger.warning(f"Connection to TV at {self.tv_ip} failed on all ports (TV may be off or disconnected)")
+            return False
+
+        except Exception as e:
+            logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
+            return False
+
+    async def _try_connect(self, port: int, ssl: bool) -> bool:
+        """Helper to try a single connection with specific port/SSL"""
+        try:
             self.tv = SamsungTVAsyncArt(
                 host=self.tv_ip,
-                port=8002,
+                port=port,
+                name=TV_NAME,
+                ssl=ssl,
                 token_file=str(self.token_file),
                 timeout=CONNECTION_TIMEOUT
             )
-
             # Test connection by getting available art
             await self.tv.available()
-            logger.info(f"Successfully connected to TV at {self.tv_ip}")
+            
+            # Fetch device info (Model/Version) for logs
+            try:
+                info = await self.tv.rest_device_info()
+                if info and 'device' in info:
+                    self.model = info['device'].get('modelName', 'Unknown')
+                    self.version = info['device'].get('firmwareVersion', 'Unknown')
+                    logger.info(f"Successfully connected to TV [{self.model}] at {self.tv_ip} (Port: {port}, SSL: {ssl}, Firmware: {self.version})")
+                else:
+                    logger.info(f"Successfully connected to TV at {self.tv_ip} (Port: {port}, SSL: {ssl})")
+            except Exception:
+                logger.info(f"Successfully connected to TV at {self.tv_ip} (Port: {port}, SSL: {ssl})")
+                
             return True
 
-        except asyncio.TimeoutError:
-            logger.warning(f"Connection to TV at {self.tv_ip} timed out (TV may be off)")
+        except (asyncio.TimeoutError, ConnectionRefusedError, Exception):
+            # Fail silently to allow for fallback retry
             return False
+            
+    async def _wake_on_lan(self) -> None:
+        """Send a Wake-on-LAN magic packet to the TV's MAC address"""
+        if not TV_MAC:
+            return
+            
+        try:
+            import socket
+            import struct
+            
+            # Remove separators from MAC address
+            mac_clean = re.sub(r'[^a-fA-F0-9]', '', TV_MAC)
+            if len(mac_clean) != 12:
+                logger.warning(f"Invalid MAC address for WoL: {TV_MAC}")
+                return
+                
+            # Create magic packet
+            data = bytes.fromhex('F' * 12 + mac_clean * 16)
+            
+            # Send to broadcast address
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.sendto(data, ('<broadcast>', 9))
+                s.sendto(data, ('255.255.255.255', 9))
+            logger.debug(f"Magic packet sent to {TV_MAC}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to send magic packet: {e}")
         except Exception as e:
             logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
             return False
