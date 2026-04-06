@@ -296,19 +296,13 @@ class TVArtworkSync:
             # --- Automatic Fallback Logic (Only for 8001 -> 8002 upgrade) ---
             if self.active_port == 8001:
                 # Safe upgrade: 8001 -> 8002
-                logger.info(f"Port 8001 failed after retries. Attempting Port 8002 fallback...")
+                logger.info(f"Port 8001 failed after retries. Attempting Port 8002 upgrade (safer for 2024+)...")
                 connected = await self._try_connect(8002)
                 if connected:
                     self.active_port = 8002
                     return True
-            elif self.active_port == 8002 and self.token_file.exists():
-                # Safe downgrade (only if we have a token, but let's be VERY conservative)
-                logger.info(f"Port 8002 failed. Attempting Port 8001 fallback only as last resort with token...")
-                connected = await self._try_connect(8001)
-                if connected:
-                    return True
 
-            logger.warning(f"Connection to TV at {self.tv_ip} failed on port {self.active_port} after all retries.")
+            logger.warning(f"Connection to TV at {self.tv_ip} failed on port {self.active_port} after all retries. No fallback to 8001 to prevent popups.")
             return False
 
         except Exception as e:
