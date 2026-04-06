@@ -40,8 +40,8 @@ MATTE_STYLE = os.getenv('MATTE_STYLE', 'none')
 TOKEN_DIR = os.getenv('TOKEN_DIR', '/tokens')
 
 # Connection settings
-TV_PORT = int(os.getenv('TV_PORT', '8001'))
-TV_NAME = os.getenv('TV_NAME', 'Samsung TV')
+TV_PORT = int(os.getenv('TV_PORT', '8002')) # Default to secure port
+TV_NAME = os.getenv('TV_NAME', 'Frame_Photo_Sync')
 TV_MAC = os.getenv('TV_MAC', '')  # Optional: used for Wake-on-LAN
 
 # Optional slideshow override settings (if any are set, all are used with defaults)
@@ -628,10 +628,12 @@ class TVArtworkSync:
             logger.info(f"Turning off TV {self.tv_ip}")
 
             # The art API uses a different websocket endpoint and can't send
-            # remote keys, so we need a separate remote control connection
+            # remote keys, so we need a separate remote control connection.
+            # We explicitly pass the same 'name' to avoid being flagged as a generic remote.
             remote = SamsungTVWSAsyncRemote(
                 host=self.tv_ip,
                 port=8002,
+                name=TV_NAME,
                 token_file=str(self.token_file),
                 timeout=CONNECTION_TIMEOUT
             )
