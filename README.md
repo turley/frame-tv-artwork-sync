@@ -46,6 +46,11 @@ This project has been updated to fully support **2024 Samsung Frame TVs (LS03D)*
 
 On first run, approve the connection on each TV when prompted. Tokens are saved for future use.
 
+> **📺 Viewing your uploaded photos on the TV:**
+> After the first sync, your photos won't appear automatically — the TV defaults to Samsung's built-in art gallery. To switch to your uploaded images:
+> **Art Mode → Art Store → My Photos**
+> Your synced collection will be there. Enable slideshow from the same menu to have them rotate automatically.
+
 ### Using Docker CLI
 
 ```bash
@@ -334,6 +339,13 @@ docker exec frame-tv-sync python3 /app/test_connection.py
 ```
 
 This tests TCP connectivity, library API compatibility, token persistence, and performs a live WebSocket handshake.
+
+**Viewing your photos after sync:**
+
+After a successful upload, your photos won't appear automatically on the TV — it defaults to Samsung's own gallery. Navigate to:
+> **Art Mode → Art Store → My Photos**
+
+Your uploaded images will be there. Enable the slideshow from this menu to cycle through your collection automatically.
 
 ## Credits
 
