@@ -81,7 +81,7 @@ if BRIGHTNESS_MIN >= BRIGHTNESS_MAX:
 SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
 
 # Timeout and delay constants (in seconds)
-CONNECTION_TIMEOUT = 30.0
+CONNECTION_TIMEOUT = 60.0
 API_TIMEOUT = 10
 UPLOAD_DELAY = 3.0
 DELETE_DELAY = 1.0
@@ -263,50 +263,66 @@ class TVArtworkSync:
             logger.warning(f"Failed to save mapping file: {e}")
 
     async def connect(self) -> bool:
-        """Connect to the TV with automatic port fallback.
+        """Connect to the TV with 'Popup-Proof' gating.
         
-        Fallback logic:
-        - If configured for port 8001 and it fails, try upgrading to 8002.
-        - If configured for port 8002, DO NOT fall back to 8001 even on failure
-          on 2024+ models to prevent the 'Allow/Deny' popup loop.
-        - Includes 3 retry attempts for the primary port with backoff.
+        1. Silent REST Gate: Ping Port 8001 (non-intrusive). 
+           If it times out, the TV is likely busy with an app like Netflix/YouTube.
+           We exit immediately to prevent Port 8002 from triggering a popup.
+        2. Secure Handshake: Only if the REST gate passes, attempt Port 8002.
         """
         try:
             # Ensure token directory exists
             self.token_file.parent.mkdir(parents=True, exist_ok=True)
 
-            # --- Primary Connection Attempt with Retries ---
-            max_retries = 3
-            for attempt in range(max_retries):
-                if attempt > 0:
-                    logger.info(f"Retrying connection to {self.tv_ip}:{self.active_port} (attempt {attempt + 1}/{max_retries})...")
-                
-                connected = await self._try_connect(self.active_port)
-                if connected:
+            # --- PHASE 0: Silent REST Gate ---
+            if not await self._is_rest_available():
+                logger.info(f"TV at {self.tv_ip} is busy or unreachable (REST Timeout). Skipping to prevent popup.")
+                return False
+
+            # --- PHASE 1: Single Primary Connection Attempt (Port 8002) ---
+            if await self._try_connect(self.active_port):
+                return True
+
+            # --- Wake-on-LAN Fallback (Only if configured) ---
+            if TV_MAC:
+                logger.info(f"Connection failed. Attempting Wake-on-LAN using {TV_MAC}...")
+                await self._wake_on_lan()
+                await asyncio.sleep(10) # Wait for network to wake
+                # Re-check REST gate after wake
+                if await self._is_rest_available() and await self._try_connect(self.active_port):
                     return True
-                
-                # --- Wake-on-LAN Attempt if first try fails ---
-                if attempt == 0 and TV_MAC:
-                    logger.info(f"Initial connection failed for {self.tv_ip}. Attempting Wake-on-LAN using {TV_MAC}...")
-                    await self._wake_on_lan()
-                    await asyncio.sleep(5)
-                else:
-                    await asyncio.sleep(3) # Small delay between generic retries
 
             # --- Automatic Fallback Logic (Only for 8001 -> 8002 upgrade) ---
             if self.active_port == 8001:
-                # Safe upgrade: 8001 -> 8002
-                logger.info(f"Port 8001 failed after retries. Attempting Port 8002 upgrade (safer for 2024+)...")
-                connected = await self._try_connect(8002)
-                if connected:
+                logger.info(f"Port 8001 failed. Trying 8002 upgrade...")
+                if await self._is_rest_available() and await self._try_connect(8002):
                     self.active_port = 8002
                     return True
 
-            logger.warning(f"Connection to TV at {self.tv_ip} failed on port {self.active_port} after all retries. No fallback to 8001 to prevent popups.")
+            logger.warning(f"Connection to TV at {self.tv_ip} failed on port {self.active_port}. No fallback to 8001 to prevent popups.")
             return False
 
         except Exception as e:
             logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
+            return False
+
+    async def _is_rest_available(self) -> bool:
+        """Check if the TV is specifically in Art Mode (Silent Gate).
+        
+        Using the /ms/art endpoint on Port 8001 is the most reliable way to check
+        Frame TV state without triggering a popup. 
+        - Art Mode = 200 OK
+        - Active Mode (YouTube/Netflix) = 404 Not Found
+        """
+        import aiohttp
+        url = f"http://{self.tv_ip}:8001/ms/art"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=3.0) as response:
+                    # Only proceed if we get a firm 200 OK (Art Mode is active)
+                    return response.status == 200
+        except Exception:
+            # Timeout or Error = Busy/Watching App
             return False
 
     async def _try_connect(self, port: int) -> bool:
