@@ -5,7 +5,7 @@ Run this from INSIDE the container to diagnose connectivity:
   docker exec frame-tv-sync python3 /app/test_connection.py
 
 Or run remotely via SSH:
-  ssh nox@192.168.1.5 "docker exec frame-tv-sync python3 /app/test_connection.py"
+  ssh user@server_ip "docker exec frame-tv-sync python3 /app/test_connection.py"
 """
 
 import asyncio
@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 # ─── Configuration ───────────────────────────────────────────────────────────
-TV_IP = os.getenv("TV_IPS", "192.168.1.106").split(",")[0].strip()
+TV_IP = os.getenv("TV_IPS", "192.168.0.10").split(",")[0].strip()
 TV_PORT = int(os.getenv("TV_PORT", "8001"))
 TV_NAME = os.getenv("TV_NAME", "ArtSync_Nox")
 TOKEN_DIR = os.getenv("TOKEN_DIR", "/tokens")
