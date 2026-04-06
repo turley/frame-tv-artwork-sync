@@ -83,8 +83,8 @@ SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
 # Timeout and delay constants (in seconds)
 CONNECTION_TIMEOUT = 30.0
 API_TIMEOUT = 10
-UPLOAD_DELAY = 1.0
-DELETE_DELAY = 0.5
+UPLOAD_DELAY = 3.0
+DELETE_DELAY = 1.0
 UPLOAD_ATTEMPTS = 2
 
 
@@ -267,47 +267,48 @@ class TVArtworkSync:
         
         Fallback logic:
         - If configured for port 8001 and it fails, try upgrading to 8002.
-        - If configured for port 8002 and it fails, fall back to 8001 ONLY
-          if a saved token already exists (from a prior 8002 handshake).
-          Port 8001 without a token triggers Allow/Deny popups on 2024+ models.
-        - If WoL is configured, wake the TV and retry before falling back.
+        - If configured for port 8002, DO NOT fall back to 8001 even on failure
+          on 2024+ models to prevent the 'Allow/Deny' popup loop.
+        - Includes 3 retry attempts for the primary port with backoff.
         """
         try:
             # Ensure token directory exists
             self.token_file.parent.mkdir(parents=True, exist_ok=True)
 
-            # --- Primary Connection Attempt ---
-            connected = await self._try_connect(self.active_port)
-            if connected:
-                return True
-
-            # --- Wake-on-LAN before fallback ---
-            if TV_MAC:
-                logger.info(f"Connection failed for {self.tv_ip}. Attempting Wake-on-LAN using {TV_MAC}...")
-                await self._wake_on_lan()
-                await asyncio.sleep(5)
-                # Retry the configured port after waking
-                if await self._try_connect(self.active_port):
+            # --- Primary Connection Attempt with Retries ---
+            max_retries = 3
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    logger.info(f"Retrying connection to {self.tv_ip}:{self.active_port} (attempt {attempt + 1}/{max_retries})...")
+                
+                connected = await self._try_connect(self.active_port)
+                if connected:
                     return True
+                
+                # --- Wake-on-LAN Attempt if first try fails ---
+                if attempt == 0 and TV_MAC:
+                    logger.info(f"Initial connection failed for {self.tv_ip}. Attempting Wake-on-LAN using {TV_MAC}...")
+                    await self._wake_on_lan()
+                    await asyncio.sleep(5)
+                else:
+                    await asyncio.sleep(3) # Small delay between generic retries
 
-            # --- Automatic Fallback Logic ---
+            # --- Automatic Fallback Logic (Only for 8001 -> 8002 upgrade) ---
             if self.active_port == 8001:
                 # Safe upgrade: 8001 -> 8002
-                logger.info(f"Port 8001 connection failed for {self.tv_ip}. Attempting Port 8002 fallback...")
+                logger.info(f"Port 8001 failed after retries. Attempting Port 8002 fallback...")
                 connected = await self._try_connect(8002)
                 if connected:
                     self.active_port = 8002
                     return True
             elif self.active_port == 8002 and self.token_file.exists():
-                # Safe downgrade: 8002 -> 8001, but ONLY if we already have a saved token.
-                # Without a token, 8001 would trigger an Allow/Deny popup on 2024+ models.
-                logger.info(f"Port 8002 connection failed for {self.tv_ip}. Falling back to Port 8001 (token exists, popup safe)...")
+                # Safe downgrade (only if we have a token, but let's be VERY conservative)
+                logger.info(f"Port 8002 failed. Attempting Port 8001 fallback only as last resort with token...")
                 connected = await self._try_connect(8001)
                 if connected:
-                    # Don't permanently change active_port — keep trying 8002 first next cycle
                     return True
 
-            logger.warning(f"Connection to TV at {self.tv_ip} failed on port {self.active_port} (TV may be off or disconnected)")
+            logger.warning(f"Connection to TV at {self.tv_ip} failed on port {self.active_port} after all retries.")
             return False
 
         except Exception as e:
@@ -691,10 +692,17 @@ class TVArtworkSync:
 
             # Upload new images
             for filename in to_upload:
-                file_path = Path(ARTWORK_DIR) / filename
-                await self.upload_image(file_path)
-                # Small delay between uploads to avoid overwhelming the TV
-                await asyncio.sleep(UPLOAD_DELAY)
+                try:
+                    file_path = Path(ARTWORK_DIR) / filename
+                    success = await self.upload_image(file_path)
+                    if not success:
+                        logger.warning(f"Failed to upload {filename}, will try next image in next cycle or after delay.")
+                    # Significant delay between uploads to accommodate 2024 TV processing
+                    await asyncio.sleep(UPLOAD_DELAY)
+                except Exception as e:
+                    logger.error(f"Error during individual upload of {filename}: {e}")
+                    await asyncio.sleep(UPLOAD_DELAY * 2) # Extra cool-off on error
+                    continue
 
             # Delete removed images (batch delete for efficiency)
             if to_delete:
