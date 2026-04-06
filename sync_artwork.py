@@ -39,9 +39,8 @@ SYNC_INTERVAL_MINUTES = int(os.getenv('SYNC_INTERVAL_MINUTES', '5'))
 MATTE_STYLE = os.getenv('MATTE_STYLE', 'none')
 TOKEN_DIR = os.getenv('TOKEN_DIR', '/tokens')
 
-# Connection settings (Auto-detecting legacy 8001 vs modern 8002/SSL)
+# Connection settings
 TV_PORT = int(os.getenv('TV_PORT', '8001'))
-TV_SSL = os.getenv('TV_SSL', 'false').lower() in ('true', '1', 'yes')
 TV_NAME = os.getenv('TV_NAME', 'Samsung TV')
 TV_MAC = os.getenv('TV_MAC', '')  # Optional: used for Wake-on-LAN
 
@@ -82,7 +81,7 @@ if BRIGHTNESS_MIN >= BRIGHTNESS_MAX:
 SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
 
 # Timeout and delay constants (in seconds)
-CONNECTION_TIMEOUT = 10.0
+CONNECTION_TIMEOUT = 30.0
 API_TIMEOUT = 10
 UPLOAD_DELAY = 1.0
 DELETE_DELAY = 0.5
@@ -240,7 +239,6 @@ class TVArtworkSync:
         self.model = "Unknown"
         self.version = "Unknown"
         self.active_port = TV_PORT
-        self.active_ssl = TV_SSL
         self._load_mapping()
 
     def _load_mapping(self) -> None:
@@ -271,23 +269,23 @@ class TVArtworkSync:
             self.token_file.parent.mkdir(parents=True, exist_ok=True)
 
             # --- Primary Connection Attempt ---
-            connected = await self._try_connect(self.active_port, self.active_ssl)
+            connected = await self._try_connect(self.active_port)
             if connected:
                 return True
 
             # --- Automatic Fallback Logic (Maintain backward compatibility) ---
             # If default port failed and we haven't already tried the 'other' common port
             if self.active_port == 8001:
-                logger.info(f"Port 8001 connection failed for {self.tv_ip}. Attempting secure Port 8002/SSL fallback...")
-                connected = await self._try_connect(8002, True)
+                logger.info(f"Port 8001 connection failed for {self.tv_ip}. Attempting Port 8002 fallback...")
+                connected = await self._try_connect(8002)
                 if connected:
-                    self.active_port, self.active_ssl = 8002, True
+                    self.active_port = 8002
                     return True
             elif self.active_port == 8002:
                 logger.info(f"Port 8002 connection failed for {self.tv_ip}. Attempting legacy Port 8001 fallback...")
-                connected = await self._try_connect(8001, False)
+                connected = await self._try_connect(8001)
                 if connected:
-                    self.active_port, self.active_ssl = 8001, False
+                    self.active_port = 8001
                     return True
 
             # --- Wake-on-LAN Fallback ---
@@ -296,7 +294,7 @@ class TVArtworkSync:
                 await self._wake_on_lan()
                 await asyncio.sleep(5)
                 # Retry current best guess
-                if await self._try_connect(self.active_port, self.active_ssl):
+                if await self._try_connect(self.active_port):
                     return True
 
             logger.warning(f"Connection to TV at {self.tv_ip} failed on all ports (TV may be off or disconnected)")
@@ -306,14 +304,13 @@ class TVArtworkSync:
             logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
             return False
 
-    async def _try_connect(self, port: int, ssl: bool) -> bool:
-        """Helper to try a single connection with specific port/SSL"""
+    async def _try_connect(self, port: int) -> bool:
+        """Helper to try a single connection with specific port"""
         try:
             self.tv = SamsungTVAsyncArt(
                 host=self.tv_ip,
                 port=port,
                 name=TV_NAME,
-                ssl=ssl,
                 token_file=str(self.token_file),
                 timeout=CONNECTION_TIMEOUT
             )
@@ -326,16 +323,19 @@ class TVArtworkSync:
                 if info and 'device' in info:
                     self.model = info['device'].get('modelName', 'Unknown')
                     self.version = info['device'].get('firmwareVersion', 'Unknown')
-                    logger.info(f"Successfully connected to TV [{self.model}] at {self.tv_ip} (Port: {port}, SSL: {ssl}, Firmware: {self.version})")
+                    logger.info(f"Successfully connected to TV [{self.model}] at {self.tv_ip} (Port: {port}, Firmware: {self.version})")
                 else:
-                    logger.info(f"Successfully connected to TV at {self.tv_ip} (Port: {port}, SSL: {ssl})")
+                    logger.info(f"Successfully connected to TV at {self.tv_ip} (Port: {port})")
             except Exception:
-                logger.info(f"Successfully connected to TV at {self.tv_ip} (Port: {port}, SSL: {ssl})")
+                logger.info(f"Successfully connected to TV at {self.tv_ip} (Port: {port})")
                 
             return True
 
-        except (asyncio.TimeoutError, ConnectionRefusedError, Exception):
-            # Fail silently to allow for fallback retry
+        except (asyncio.TimeoutError, ConnectionRefusedError) as e:
+            logger.debug(f"Connection to {self.tv_ip}:{port} failed: {type(e).__name__}: {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"Unexpected error connecting to {self.tv_ip}:{port}: {type(e).__name__}: {e}")
             return False
             
     async def _wake_on_lan(self) -> None:
@@ -365,9 +365,6 @@ class TVArtworkSync:
             
         except Exception as e:
             logger.warning(f"Failed to send magic packet: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
-            return False
 
     async def is_in_art_mode(self) -> bool:
         """Check if the TV is currently in art mode (not being used for other content)"""
