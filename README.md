@@ -8,11 +8,12 @@ Automatically sync artwork from a local folder to Samsung Frame TVs using Docker
 
 This project has been updated to fully support **2024 Samsung Frame TVs (LS03D)** and newer firmware (v2.0.25+) while maintaining **100% backward compatibility** with older models. Key features include:
 
-- **Port 8002 for Token Persistence**: 2024 models require Port 8002 for the WebSocket token exchange. Port 8001 connects but **does not persist auth tokens**, causing repeated "Allow/Deny" popups on every restart. The script auto-falls back between ports.
-- **Unique App Identity (`TV_NAME`)**: Setting a unique `TV_NAME` (e.g., `ArtSync_MyServer`) creates a permanent trust profile on the TV, eliminating repeated authorization prompts.
+- **Silent REST Gate**: Probes the TV's Art Service (`/ms/art`) before connecting. If you are watching an app (Netflix, YouTube, etc.), the script exits silently, preventing disruptive popups.
+- **Port 8002 for Token Persistence**: 2024 models require Port 8002 for the WebSocket token exchange. This ensures auth tokens are saved correctly to your `/tokens` volume.
+- **Unique App Identity (`TV_NAME`)**: Standardized as `Frame_Photo_Sync` to create a permanent trust profile, eliminating "Samsung Remote" prompts.
 - **Wake-on-LAN**: Automatically wake sleeping TVs before syncing using their MAC address.
-- **System Insight**: Automatically logs your TV's Model and Firmware version during the sync cycle for easier troubleshooting.
-- **Connection Diagnostics**: Includes `test_connection.py` for troubleshooting connectivity, token persistence, and library compatibility from inside the container.
+- **System Insight**: Automatically logs your TV's Model and Firmware version for easier troubleshooting.
+- **Connection Diagnostics**: Includes `test_connection.py` for troubleshooting connectivity and token persistence.
 
 ## Features
 
@@ -62,7 +63,9 @@ docker run -d \
   --name frame-tv-sync \
   --restart unless-stopped \
   -e TV_IPS="192.168.1.100,192.168.1.101" \
-  -e SYNC_INTERVAL_MINUTES="5" \
+  -e TV_PORT="8002" \
+  -e TV_NAME="Frame_Photo_Sync" \
+  -e SYNC_INTERVAL_MINUTES="15" \
   -v ./artwork:/artwork \
   -v ./tokens:/tokens \
   turley/frame-tv-artwork-sync
@@ -75,10 +78,10 @@ All settings are configured via environment variables:
 | Variable                   | Description                                                                               | Default      |
 | -------------------------- | ----------------------------------------------------------------------------------------- | ------------ |
 | `TV_IPS`                   | Comma-separated TV IP addresses (required)                                                | -            |
-| `SYNC_INTERVAL_MINUTES`    | How often to sync (in minutes)                                                            | `5`          |
-| `TV_PORT`                  | Connection port. **Use `8002` for 2024+ models** (required for token persistence). Script auto-falls back between ports. | `8001`       |
-| `TV_NAME`                  | App name for the handshake. **Set a unique name for 2024+ models** to create a permanent trust profile (e.g., `ArtSync_MyServer`). | `Samsung TV` |
+| `TV_PORT`                  | Connection port. Defaults to **`8002`** for 2024+ model persistence.       | `8002`       |
+| `TV_NAME`                  | App identity for the handshake. Defaults to **`Frame_Photo_Sync`**.              | `Frame_Photo_Sync` |
 | `TV_MAC`                   | TV MAC Address for Wake-on-LAN (wakes sleeping TVs before sync)                           | (unset)      |
+| `SYNC_INTERVAL_MINUTES`    | How often to sync (in minutes). Defaults to **`15`** for stability.                                                            | `15`          |
 | `MATTE_STYLE`              | Border style (see [Matte Styles](#matte-styles) below)                                    | `none`       |
 | `SLIDESHOW_ENABLED`        | Enable slideshow (true/false) - overrides TV settings if set                              | (unset)      |
 | `SLIDESHOW_INTERVAL`       | Slideshow interval in minutes (use values supported by your TV model)                     | `15`         |

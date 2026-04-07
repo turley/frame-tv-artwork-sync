@@ -35,12 +35,12 @@ logger = logging.getLogger(__name__)
 ARTWORK_DIR = os.getenv('ARTWORK_DIR', '/artwork')
 TV_IPS = os.getenv('TV_IPS', '').split(',')
 TV_IPS = [ip.strip() for ip in TV_IPS if ip.strip()]
-SYNC_INTERVAL_MINUTES = int(os.getenv('SYNC_INTERVAL_MINUTES', '5'))
+SYNC_INTERVAL_MINUTES = int(os.getenv('SYNC_INTERVAL_MINUTES', '15'))
 MATTE_STYLE = os.getenv('MATTE_STYLE', 'none')
 TOKEN_DIR = os.getenv('TOKEN_DIR', '/tokens')
 
 # Connection settings
-TV_PORT = int(os.getenv('TV_PORT', '8002')) # Default to secure port
+TV_PORT = int(os.getenv('TV_PORT', '8002'))
 TV_NAME = os.getenv('TV_NAME', 'Frame_Photo_Sync')
 TV_MAC = os.getenv('TV_MAC', '')  # Optional: used for Wake-on-LAN
 
@@ -81,7 +81,7 @@ if BRIGHTNESS_MIN >= BRIGHTNESS_MAX:
 SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
 
 # Timeout and delay constants (in seconds)
-CONNECTION_TIMEOUT = 60.0
+CONNECTION_TIMEOUT = 60.0 # Standardized to allow for manual TV authorization
 API_TIMEOUT = 10
 UPLOAD_DELAY = 3.0
 DELETE_DELAY = 1.0

@@ -9,15 +9,15 @@ services:
       TV_IPS: "192.168.1.100,192.168.1.101"
 
       # How often to check and sync (in minutes)
-      SYNC_INTERVAL_MINUTES: "5"
+      SYNC_INTERVAL_MINUTES: "15"
 
       # Matte style: none, shadowbox_polar, modern_apricot, etc.
       MATTE_STYLE: "none"
 
       # 2024+ Model Support (LS03D and newer):
-      # TV_PORT: "8002"                    # Required for token persistence on 2024+ models
-      # TV_NAME: "ArtSync_MyServer"        # Unique name = permanent trust profile (no more Allow/Deny popups)
-      # TV_MAC: "AA:BB:CC:DD:EE:FF"        # MAC address for Wake-on-LAN (wakes sleeping TVs)
+      TV_PORT: "8002"                    # Required for token persistence on 2024+ models
+      TV_NAME: "Frame_Photo_Sync"        # Unique name = permanent trust profile (no more Allow/Deny popups)
+      TV_MAC: "00:00:00:00:00:00"        # MAC address for Wake-on-LAN (wakes sleeping TVs)
 
       # Optional: Slideshow Control
       # Uncomment to override TV's slideshow settings:
