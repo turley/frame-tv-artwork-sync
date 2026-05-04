@@ -19,8 +19,7 @@ import datetime
 import zoneinfo
 
 from samsungtvws.async_art import SamsungTVAsyncArt
-from samsungtvws.async_remote import SamsungTVWSAsyncRemote
-from samsungtvws.remote import SamsungTVWS, SendRemoteKey
+from samsungtvws.remote import SamsungTVWS
 
 from pysolar.solar import get_altitude
 
@@ -64,10 +63,6 @@ REMOVE_UNKNOWN_IMAGES = os.getenv('REMOVE_UNKNOWN_IMAGES', '').lower() in ('true
 # Client name sent to the TV during WebSocket handshake
 CLIENT_NAME = os.getenv('CLIENT_NAME', 'FrameTVArtworkSync')
 
-# Optional auto-off settings (turn off TVs at a specific time when in art mode)
-AUTO_OFF_TIME = os.getenv('AUTO_OFF_TIME', '')  # 24-hour format, e.g., "22:00"
-AUTO_OFF_GRACE_HOURS = float(os.getenv('AUTO_OFF_GRACE_HOURS', '2'))  # Hours after AUTO_OFF_TIME to keep trying
-
 # Dry run mode (set by command line argument)
 DRY_RUN = False
 
@@ -82,56 +77,11 @@ SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
 # Timeout and delay constants (in seconds)
 CONNECTION_TIMEOUT = float(os.getenv('CONNECTION_TIMEOUT', '10.0'))
 AUTH_TIMEOUT = float(os.getenv('AUTH_TIMEOUT', '30.0'))
-KEEPALIVE_INTERVAL = int(os.getenv('KEEPALIVE_INTERVAL', '60'))  # seconds
+KEEPALIVE_INTERVAL = int(os.getenv('KEEPALIVE_INTERVAL', '60'))
 API_TIMEOUT = 10
 UPLOAD_DELAY = 1.0
 DELETE_DELAY = 0.5
 UPLOAD_ATTEMPTS = 2
-
-
-def is_within_auto_off_window() -> bool:
-    """
-    Check if the current time is within the auto-off window.
-
-    The window starts at AUTO_OFF_TIME and extends for AUTO_OFF_GRACE_HOURS.
-    Returns True if we should attempt to turn off TVs that are in art mode.
-    """
-    if not AUTO_OFF_TIME:
-        return False
-
-    try:
-        # Parse the configured off time
-        off_hour, off_minute = map(int, AUTO_OFF_TIME.split(':'))
-
-        # Get current time in the configured timezone
-        tz = zoneinfo.ZoneInfo(LOCATION_TIMEZONE)
-        now = datetime.datetime.now(tz)
-
-        # Create today's off time
-        today_off_time = now.replace(hour=off_hour, minute=off_minute, second=0, microsecond=0)
-
-        # Calculate the end of the grace period
-        grace_end = today_off_time + datetime.timedelta(hours=AUTO_OFF_GRACE_HOURS)
-
-        # Handle the case where the window spans midnight
-        # If we're before today's off time, check if we're in yesterday's window
-        if now < today_off_time:
-            yesterday_off_time = today_off_time - datetime.timedelta(days=1)
-            yesterday_grace_end = yesterday_off_time + datetime.timedelta(hours=AUTO_OFF_GRACE_HOURS)
-            if yesterday_off_time <= now < yesterday_grace_end:
-                logger.debug(f"Within auto-off window (from yesterday): {yesterday_off_time.strftime('%H:%M')} to {yesterday_grace_end.strftime('%H:%M')}")
-                return True
-
-        # Check if we're in today's window
-        if today_off_time <= now < grace_end:
-            logger.debug(f"Within auto-off window: {today_off_time.strftime('%H:%M')} to {grace_end.strftime('%H:%M')}")
-            return True
-
-        return False
-
-    except Exception as e:
-        logger.warning(f"Failed to check auto-off window: {e}")
-        return False
 
 
 def brightness_from_elevation(elevation: float) -> int:
@@ -152,20 +102,13 @@ def brightness_from_elevation(elevation: float) -> int:
     if elevation <= 0:
         return BRIGHTNESS_MIN
 
-    # Convert elevation to radians for calculation
     import math
     elevation_rad = math.radians(elevation)
 
     # Calculate air mass (AM) using Kasten-Young formula
-    # This provides accurate results at all sun angles, especially near horizon
-    # At zenith (90°): AM ≈ 1.0 (shortest path)
-    # At 30° elevation: AM ≈ 2.0 (twice the atmosphere)
     air_mass = 1.0 / (math.sin(elevation_rad) + 0.50572 * (elevation + 6.07995)**(-1.6364))
 
     # Apply Kasten-Young atmospheric attenuation formula
-    # Relative irradiance = 0.7^(AM^0.678)
-    # This models how atmosphere absorbs/scatters sunlight
-    # 0.7 represents typical clear-sky atmospheric transmittance
     relative_irradiance = 0.7 ** (air_mass ** 0.678)
 
     # Map relative irradiance (0.0 to 1.0) to brightness range
@@ -187,17 +130,14 @@ def calculate_solar_brightness() -> Optional[int]:
         return None
 
     try:
-        # Get current time in the specified timezone
         tz = zoneinfo.ZoneInfo(LOCATION_TIMEZONE)
         local_time = datetime.datetime.now(tz)
         utc_time = local_time.astimezone(datetime.timezone.utc)
 
-        # Calculate sun elevation angle in degrees
         elevation = get_altitude(LOCATION_LATITUDE, LOCATION_LONGITUDE, utc_time)
 
         logger.debug(f"Sun elevation at {local_time.strftime('%Y-%m-%d %H:%M %Z')}: {elevation:.2f}°")
 
-        # Calculate brightness from elevation
         brightness = brightness_from_elevation(elevation)
 
         if elevation <= 0:
@@ -221,9 +161,7 @@ def sanitize_filename(filename: str) -> str:
     """
     stem = Path(filename).stem
     ext = Path(filename).suffix.lower()
-    # Keep only alphanumeric, spaces, hyphens, underscores
     stem = re.sub(r'[^a-zA-Z0-9 _-]', '', stem)
-    # Collapse multiple spaces
     stem = re.sub(r' +', ' ', stem).strip()
     return f"{stem}{ext}" if stem else f"image{ext}"
 
@@ -261,7 +199,7 @@ class TVArtworkSync:
             logger.warning(f"Failed to save mapping file: {e}")
 
     async def connect(self) -> bool:
-        """Connect to the TV, with retry logic for dropped channels and stale tokens."""
+        """Connect to the TV, handling first-time pairing and stale tokens."""
         try:
             self.token_file.parent.mkdir(parents=True, exist_ok=True)
             return await self._try_connect(use_existing_token=True)
@@ -270,12 +208,18 @@ class TVArtworkSync:
             return False
 
     async def _try_connect(self, use_existing_token: bool = True, attempt: int = 1) -> bool:
+        """
+        Internal connection helper with retry logic.
+        - First-time pairing: waits for token then reconnects cleanly (1 approval needed)
+        - ms.channel.timeOut: TV rejected token, delete and re-pair
+        - ms.channel.clientDisconnect: genuine drop, retry with same token
+        - Other auth failures: delete token and re-pair
+        """
         if attempt > 5:
             logger.warning(f"Giving up connecting to TV at {self.tv_ip} after 5 attempts")
             return False
 
         token_exists = self.token_file.exists()
-
         timeout = CONNECTION_TIMEOUT if (use_existing_token and token_exists) else AUTH_TIMEOUT
 
         try:
@@ -288,18 +232,20 @@ class TVArtworkSync:
             )
 
             t0 = time.monotonic()
+
             if not token_exists:
-                # First-time pairing: the TV will issue a token then disconnect.
-                # Just wait for the token to be written, then reconnect cleanly.
+                # First-time pairing: the TV issues a token then disconnects.
+                # Call available() just to trigger the pairing handshake;
+                # expect it to fail with a disconnect — that's normal.
                 logger.info(f"No token for TV {self.tv_ip}, waiting for pairing approval on TV...")
                 try:
                     await self.tv.available()
                 except Exception:
                     pass  # Expected disconnect after token issuance — ignore it
 
-                # Check if we got a token
+                # Check if we got a token written to disk
                 if self.token_file.exists():
-                    logger.info(f"Token received, reconnecting to TV {self.tv_ip}...")
+                    logger.info(f"Token received for TV {self.tv_ip}, reconnecting...")
                     await asyncio.sleep(2)
                     return await self._try_connect(use_existing_token=True, attempt=attempt + 1)
                 else:
@@ -320,20 +266,24 @@ class TVArtworkSync:
         except Exception as e:
             elapsed = time.monotonic() - t0
             error_str = str(e)
-            is_channel_drop = 'timeOut' in error_str or 'clientDisconnect' in error_str
+            is_rejection = 'timeOut' in error_str
+            is_drop = 'clientDisconnect' in error_str
 
-            if is_channel_drop and elapsed < 1.0:
-                logger.warning(f"Instant channel drop for TV {self.tv_ip} — stale token, deleting and re-pairing...")
+            if is_rejection:
+                # TV rejected our token — always treat as stale
+                logger.warning(f"TV {self.tv_ip} rejected token after {elapsed:.2f}s — deleting and re-pairing...")
                 if self.token_file.exists():
                     self.token_file.unlink()
                 return await self._try_connect(use_existing_token=False, attempt=attempt + 1)
 
-            elif is_channel_drop:
+            elif is_drop:
+                # Genuine mid-session disconnect — token is still valid, retry
                 logger.warning(f"Channel dropped for TV {self.tv_ip} (attempt {attempt}) after {elapsed:.2f}s, retrying with existing token...")
                 await asyncio.sleep(10)
                 return await self._try_connect(use_existing_token=True, attempt=attempt + 1)
 
             elif token_exists and use_existing_token:
+                # Some other error with a cached token — assume stale and re-pair
                 logger.warning(f"Connection failed for {self.tv_ip} ({e}), deleting stale token and re-pairing...")
                 self.token_file.unlink()
                 return await self._try_connect(use_existing_token=False, attempt=attempt + 1)
@@ -342,17 +292,22 @@ class TVArtworkSync:
                 logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
                 return False
 
+    async def close(self) -> None:
+        """Close connection to TV"""
+        if self.tv:
+            try:
+                await self.tv.close()
+            except Exception:
+                pass
+
     async def is_in_art_mode(self) -> bool:
         """Check if the TV is currently in art mode (not being used for other content)"""
         try:
-            # First check if TV is on
             is_on = await self.tv.on()
             if not is_on:
-                # TV is off - safe to skip (will be synced when it turns on)
                 logger.debug(f"TV {self.tv_ip} is powered off")
                 return False
 
-            # Check if TV is in art mode
             art_mode_status = await self.tv.get_artmode()
             is_art_mode = art_mode_status == 'on'
 
@@ -361,8 +316,6 @@ class TVArtworkSync:
 
         except Exception as e:
             logger.debug(f"Could not determine art mode status for TV {self.tv_ip}: {e}")
-            # If we can't determine the state, assume it's safe to sync
-            # (this preserves backward-compatible behavior)
             return True
 
     async def get_local_images(self) -> Set[str]:
@@ -391,20 +344,16 @@ class TVArtworkSync:
             - unknown_content_ids: Set of content_ids on TV that we don't recognize
         """
         try:
-            # Get available images from "MY-C0002" category (My Photos/uploaded images only)
             available = await self.tv.available(category='MY-C0002')
             tv_content_ids = set()
 
-            # Debug: log the raw response
             logger.debug(f"Available response: {available}")
 
-            # The API returns a list directly, collect content_ids
             if available and isinstance(available, list):
                 for item in available:
                     if 'content_id' in item:
                         tv_content_ids.add(item['content_id'])
 
-            # Map content_ids back to filenames using our mapping
             tracked_files = set()
             unknown_content_ids = set()
             reverse_mapping = {v: k for k, v in self.file_mapping.items()}
@@ -429,7 +378,6 @@ class TVArtworkSync:
             logger.info(f"[DRY RUN] Would upload {file_path.name} to TV {self.tv_ip}")
             return True
 
-        # Create a temp copy with a sanitized filename
         safe_name = sanitize_filename(file_path.name)
         use_temp = safe_name != file_path.name
         temp_dir = None
@@ -458,7 +406,6 @@ class TVArtworkSync:
                     )
 
                     if content_id:
-                        # Save the mapping using the original filename as the key
                         self.file_mapping[file_path.name] = content_id
                         self._save_mapping()
                         logger.info(f"Successfully uploaded {file_path.name} to TV {self.tv_ip} (content_id: {content_id})")
@@ -489,9 +436,7 @@ class TVArtworkSync:
             logger.debug(f"Checking slideshow settings on TV {self.tv_ip}")
 
             get_result = await self.tv._send_art_request(
-                {
-                    "request": "get_slideshow_status"
-                },
+                {"request": "get_slideshow_status"},
                 timeout=API_TIMEOUT
             )
 
@@ -499,14 +444,12 @@ class TVArtworkSync:
                 logger.debug(f"Could not get slideshow status from TV {self.tv_ip}")
                 return None
 
-            # Parse the current settings
             current_value = get_result.get('value', 'off')
             current_type = get_result.get('type', 'shuffleslideshow')
             current_category = get_result.get('category_id', 'MY-C0002')
 
             logger.info(f"TV {self.tv_ip} slideshow settings: value={current_value}, type={current_type}, category={current_category}")
 
-            # Return settings only if slideshow is enabled
             if current_value != 'off' and current_value:
                 return {
                     'value': current_value,
@@ -573,52 +516,17 @@ class TVArtworkSync:
             logger.warning(f"Could not set brightness on TV {self.tv_ip}: {e}")
             return False
 
-    async def turn_off(self) -> bool:
-        """Turn off the TV via a separate remote control connection"""
-        if DRY_RUN:
-            logger.info(f"[DRY RUN] Would turn off TV {self.tv_ip}")
-            return True
-
-        try:
-            logger.info(f"Turning off TV {self.tv_ip}")
-
-            # The art API uses a different websocket endpoint and can't send
-            # remote keys, so we need a separate remote control connection
-            remote = SamsungTVWSAsyncRemote(
-                host=self.tv_ip,
-                port=8002,
-                token_file=str(self.token_file),
-                timeout=CONNECTION_TIMEOUT,
-                name=CLIENT_NAME
-            )
-            try:
-                # Frame TVs require holding the power button for 3 seconds to
-                # actually power off. A single press just toggles art mode.
-                await remote.send_commands(SendRemoteKey.hold("KEY_POWER", 3))
-                logger.info(f"Successfully turned off TV {self.tv_ip}")
-                return True
-            finally:
-                await remote.close()
-
-        except Exception as e:
-            logger.warning(f"Could not turn off TV {self.tv_ip}: {e}")
-            return False
-
     async def sync(self, local_images: Set[str] = None) -> bool:
         """Synchronize artwork with the TV"""
         try:
-            # Get local images if not provided
             if local_images is None:
                 local_images = await self.get_local_images()
 
-            # Get TV images (tracked and unknown)
             tv_images, unknown_images = await self.get_tv_images()
 
-            # Determine what to upload and delete
             to_upload = local_images - tv_images
             to_delete = tv_images - local_images
 
-            # Handle unknown images based on configuration
             if unknown_images:
                 if REMOVE_UNKNOWN_IMAGES:
                     logger.info(f"TV {self.tv_ip}: Found {len(unknown_images)} unknown images, will remove them (REMOVE_UNKNOWN_IMAGES=true)")
@@ -628,7 +536,6 @@ class TVArtworkSync:
 
             logger.info(f"TV {self.tv_ip} sync: {len(to_upload)} to upload, {len(to_delete)} tracked to delete{f', {len(unknown_images)} unknown to delete' if REMOVE_UNKNOWN_IMAGES and unknown_images else ''}")
 
-            # Determine desired slideshow settings from environment (checked every sync run)
             desired_slideshow_settings = None
             if SLIDESHOW_OVERRIDE and SLIDESHOW_ENABLED:
                 slideshow_type = 'shuffleslideshow' if SLIDESHOW_TYPE == 'shuffle' else 'slideshow'
@@ -638,17 +545,12 @@ class TVArtworkSync:
                     'category_id': 'MY-C0002'
                 }
 
-            # For image changes without override, we need to preserve TV's current settings
             preserve_slideshow_settings = None
             if (to_upload or to_delete or (REMOVE_UNKNOWN_IMAGES and unknown_images)) and local_images:
                 if not SLIDESHOW_OVERRIDE:
-                    # Preserve TV's current slideshow settings to restore after image changes
                     preserve_slideshow_settings = await self.get_slideshow_settings()
 
-            # Determine brightness to apply (every sync run, regardless of image changes)
             brightness_to_apply = None
-
-            # Solar brightness takes precedence over manual brightness
             solar_brightness = calculate_solar_brightness()
             if solar_brightness is not None:
                 brightness_to_apply = solar_brightness
@@ -656,17 +558,14 @@ class TVArtworkSync:
                 brightness_to_apply = BRIGHTNESS
                 logger.info(f"Using manual brightness override: {BRIGHTNESS}")
 
-            # Upload new images
             for filename in to_upload:
                 file_path = Path(ARTWORK_DIR) / filename
                 await self.upload_image(file_path)
-                # Small delay between uploads to avoid overwhelming the TV
                 await asyncio.sleep(UPLOAD_DELAY)
 
-            # Delete removed images (batch delete for efficiency)
             if to_delete:
                 content_ids_to_delete = [self.file_mapping.get(filename) for filename in to_delete]
-                content_ids_to_delete = [cid for cid in content_ids_to_delete if cid]  # Filter out None values
+                content_ids_to_delete = [cid for cid in content_ids_to_delete if cid]
 
                 if content_ids_to_delete:
                     if DRY_RUN:
@@ -675,7 +574,6 @@ class TVArtworkSync:
                         logger.info(f"Deleting {len(content_ids_to_delete)} tracked images from TV {self.tv_ip}")
                         try:
                             await self.tv.delete_list(content_ids_to_delete)
-                            # Remove from mapping
                             for filename in to_delete:
                                 if filename in self.file_mapping:
                                     del self.file_mapping[filename]
@@ -684,7 +582,6 @@ class TVArtworkSync:
                         except Exception as e:
                             logger.warning(f"Error batch deleting tracked images from TV {self.tv_ip}: {e}")
 
-            # Delete unknown images if configured (batch delete for efficiency)
             if REMOVE_UNKNOWN_IMAGES and unknown_images:
                 if DRY_RUN:
                     logger.info(f"[DRY RUN] Would delete {len(unknown_images)} unknown images from TV {self.tv_ip}")
@@ -696,9 +593,7 @@ class TVArtworkSync:
                     except Exception as e:
                         logger.warning(f"Error batch deleting unknown images from TV {self.tv_ip}: {e}")
 
-            # If we made changes and have images, select an image and restore preserved slideshow
             if local_images and (to_upload or to_delete or (REMOVE_UNKNOWN_IMAGES and unknown_images)):
-                # Verify file_mapping against what's actually on the TV now
                 verified_mapping = {}
                 try:
                     current_on_tv, _ = await self.get_tv_images()
@@ -709,9 +604,7 @@ class TVArtworkSync:
 
                 if verified_mapping:
                     try:
-                        # Pick random image if shuffle mode, otherwise pick first
                         import random
-                        # Use desired settings if available, otherwise preserved settings for shuffle check
                         settings_for_mode = desired_slideshow_settings or preserve_slideshow_settings
                         if settings_for_mode and settings_for_mode.get('type') == 'shuffleslideshow':
                             content_id = random.choice(list(verified_mapping.values()))
@@ -729,7 +622,6 @@ class TVArtworkSync:
                         if not DRY_RUN:
                             await self.tv.select_image(content_id, show=True)
 
-                        # Restore preserved slideshow settings (when no override is set)
                         if preserve_slideshow_settings:
                             await self.restart_slideshow(preserve_slideshow_settings)
 
@@ -738,11 +630,9 @@ class TVArtworkSync:
                 else:
                     logger.warning(f"No verified images available on TV {self.tv_ip} to select, skipping image selection")
 
-            # Apply slideshow settings every sync run if override is set (compare with current to avoid unnecessary updates)
             if desired_slideshow_settings:
                 try:
                     current_settings = await self.get_slideshow_settings()
-                    # Check if settings differ (compare value and type)
                     needs_update = (
                         not current_settings or
                         current_settings.get('value') != desired_slideshow_settings['value'] or
@@ -756,7 +646,6 @@ class TVArtworkSync:
                 except Exception as e:
                     logger.warning(f"Failed to update slideshow settings on TV {self.tv_ip}: {e}")
 
-            # Apply brightness every sync run (not just when images change)
             if brightness_to_apply is not None:
                 try:
                     await self.set_brightness(brightness_to_apply)
@@ -769,6 +658,8 @@ class TVArtworkSync:
         except Exception as e:
             logger.warning(f"Error during sync for TV {self.tv_ip}: {e}")
             return False
+
+
 async def sync_all_tvs() -> None:
     """Synchronize artwork to all configured TVs"""
     if not TV_IPS:
@@ -800,14 +691,10 @@ async def sync_all_tvs() -> None:
         await asyncio.gather(*[tv.close() for tv in tv_syncs])
         return
 
+    logger.info(f"Syncing {len(tvs_to_sync)} TV(s) in art mode")
     local_images = await tvs_to_sync[0].get_local_images() if tvs_to_sync else set()
-    await asyncio.gather(*[tv.sync(local_images) for tv in tvs_to_sync])
 
-    if is_within_auto_off_window():
-        grace_display = int(AUTO_OFF_GRACE_HOURS) if AUTO_OFF_GRACE_HOURS == int(AUTO_OFF_GRACE_HOURS) else AUTO_OFF_GRACE_HOURS
-        logger.info(f"Within auto-off window ({AUTO_OFF_TIME} + {grace_display}h grace), turning off TVs in art mode")
-        for tv_sync in tvs_to_sync:
-            await tv_sync.turn_off()
+    await asyncio.gather(*[tv.sync(local_images) for tv in tvs_to_sync])
 
     # Keep connections alive until next sync instead of closing and reopening
     logger.info(f"Keeping connections alive for {SYNC_INTERVAL_MINUTES} minute(s) until next sync...")
@@ -863,7 +750,6 @@ if __name__ == '__main__':
 
             from solar_test_output import run_solar_brightness_test
 
-            # Use the actual brightness calculation function
             run_solar_brightness_test(
                 LOCATION_LATITUDE,
                 LOCATION_LONGITUDE,
