@@ -197,6 +197,22 @@ With this configuration:
 
 **Note:** `LOCATION_TIMEZONE` is required for this feature to work correctly.
 
+### Connection Tuning
+
+Advanced knobs for the TV WebSocket connection. Defaults work for most setups; tune these only if you're seeing flaky connects, repeated re-auth prompts, or pairing failures.
+
+| Variable                   | Description                                                                                              | Default |
+| -------------------------- | -------------------------------------------------------------------------------------------------------- | ------- |
+| `CONNECTION_TIMEOUT`       | WebSocket timeout (seconds) for normal connects with an existing token                                   | `10.0`  |
+| `AUTH_TIMEOUT`             | WebSocket timeout (seconds) during first-time pairing (allows time for approval on the TV)               | `30.0`  |
+| `KEEPALIVE_INTERVAL`       | Seconds between keepalive pings while waiting for the next sync (must be >= 1)                           | `60`    |
+| `CONNECT_MAX_ATTEMPTS`     | Retry budget for connect errors (channel drops, transient failures). Excludes pairing retries.           | `3`     |
+| `CHANNEL_DROP_RETRY_DELAY` | Seconds to wait between connect retries after a channel drop                                             | `3.0`   |
+| `PAIRING_MAX_RETRIES`      | Retries while waiting for first-time pairing approval on the TV                                          | `5`     |
+| `PAIRING_RETRY_DELAY`      | Seconds between pairing retries (sized for human reaction time)                                          | `5.0`   |
+
+The keepalive ping prevents some Frame TVs from prompting for re-authentication between syncs. If you have a flaky network or notice repeated re-auth prompts, you can increase `PAIRING_MAX_RETRIES` or shorten `KEEPALIVE_INTERVAL`.
+
 ## Image Requirements
 
 **Supported Formats:** JPEG, JPG, PNG

@@ -97,6 +97,8 @@ AUTH_TIMEOUT = float(os.getenv('AUTH_TIMEOUT', '30.0'))
 KEEPALIVE_INTERVAL = int(os.getenv('KEEPALIVE_INTERVAL', '60'))  # seconds
 CONNECT_MAX_ATTEMPTS = int(os.getenv('CONNECT_MAX_ATTEMPTS', '3'))
 CHANNEL_DROP_RETRY_DELAY = float(os.getenv('CHANNEL_DROP_RETRY_DELAY', '3.0'))
+PAIRING_MAX_RETRIES = int(os.getenv('PAIRING_MAX_RETRIES', '5'))
+PAIRING_RETRY_DELAY = float(os.getenv('PAIRING_RETRY_DELAY', '5.0'))
 API_TIMEOUT = 10
 
 # Validate intervals — values < 1 cause busy/infinite loops in wait_until_next_sync
@@ -283,93 +285,117 @@ class TVArtworkSync:
             logger.warning(f"Failed to save mapping file: {e}")
 
     async def connect(self) -> bool:
-        """Connect to the TV, with retry logic for dropped channels and stale tokens."""
+        """Connect to the TV, handling first-time pairing and stale tokens."""
         try:
             self.token_file.parent.mkdir(parents=True, exist_ok=True)
-            return await self._try_connect(use_existing_token=True)
+            return await self._try_connect()
         except Exception as e:
             logger.warning(f"Unexpected error connecting to TV at {self.tv_ip}: {e}")
             return False
 
-    async def _try_connect(self, use_existing_token: bool = True, attempt: int = 1) -> bool:
-        if attempt > CONNECT_MAX_ATTEMPTS:
-            logger.warning(f"Giving up connecting to TV at {self.tv_ip} after {CONNECT_MAX_ATTEMPTS} attempts")
-            return False
+    async def _try_connect(self) -> bool:
+        """
+        Try to connect to the TV, with bounded retries.
 
-        token_exists = self.token_file.exists()
+        Pairing-flow phase transitions (acquiring a token after user approval)
+        don't count against the attempt budget — _acquire_token has its own
+        internal retry loop sized for human reaction time.
+        """
+        for attempt in range(1, CONNECT_MAX_ATTEMPTS + 1):
+            # Acquire a token first if we don't have one.
+            if not self.token_file.exists():
+                if not await self._acquire_token():
+                    logger.warning(f"Failed to acquire token for TV {self.tv_ip}, retrying...")
+                    await asyncio.sleep(CHANNEL_DROP_RETRY_DELAY)
+                    continue
 
-        timeout = CONNECTION_TIMEOUT if (use_existing_token and token_exists) else AUTH_TIMEOUT
-
-        t0 = time.monotonic()
-        try:
-            self.tv = SamsungTVAsyncArt(
-                host=self.tv_ip,
-                port=8002,
-                token_file=str(self.token_file),
-                timeout=timeout,
-                name=CLIENT_NAME
-            )
-
-            if not token_exists:
-                # First-time pairing: the TV will issue a token then disconnect.
-                # Just wait for the token to be written, then reconnect cleanly.
-                logger.info(f"No token for TV {self.tv_ip}, waiting for pairing approval on TV...")
-                try:
-                    await self.tv.available()
-                except Exception:
-                    pass  # Expected disconnect after token issuance — ignore it
-
-                # Check if we got a token
-                if self.token_file.exists():
-                    logger.info(f"Token received, reconnecting to TV {self.tv_ip}...")
-                    await asyncio.sleep(2)
-                    return await self._try_connect(use_existing_token=True, attempt=attempt + 1)
-                else:
-                    logger.warning(f"No token written after pairing attempt for TV {self.tv_ip}, retrying...")
-                    await asyncio.sleep(3)
-                    return await self._try_connect(use_existing_token=False, attempt=attempt + 1)
-
-            else:
-                # Normal connection with existing token
+            # Use the token.
+            t0 = time.monotonic()
+            try:
+                self.tv = SamsungTVAsyncArt(
+                    host=self.tv_ip,
+                    port=8002,
+                    token_file=str(self.token_file),
+                    timeout=CONNECTION_TIMEOUT,
+                    name=CLIENT_NAME
+                )
                 await self.tv.available()
                 logger.info(f"Successfully connected to TV at {self.tv_ip} (attempt {attempt})")
                 return True
 
-        except asyncio.TimeoutError:
-            logger.warning(f"Connection to TV at {self.tv_ip} timed out (TV may be off)")
-            return False
+            except asyncio.TimeoutError:
+                logger.warning(f"Connection to TV at {self.tv_ip} timed out (TV may be off)")
+                return False
 
-        except UnauthorizedError:
-            logger.warning(f"Token rejected by TV {self.tv_ip}, deleting and re-pairing...")
-            if self.token_file.exists():
-                self.token_file.unlink()
-            return await self._try_connect(use_existing_token=False, attempt=attempt + 1)
+            except UnauthorizedError:
+                logger.warning(f"Token rejected by TV {self.tv_ip}, deleting and re-pairing...")
+                self.token_file.unlink(missing_ok=True)
+                continue
 
-        except ConnectionFailure as e:
-            # Upstream raises ConnectionFailure for ms.channel.timeOut and
-            # ms.channel.clientDisconnect events during the initial handshake.
-            # Per upstream's own diagnostics, ms.channel.timeOut means
-            # "connection not accepted on TV, or token missing/incorrect" — so
-            # treat it as a token rejection. ms.channel.clientDisconnect is more
-            # ambiguous; treat it as transient and let max-attempts catch
-            # repeated failures.
-            elapsed = time.monotonic() - t0
-            event = ""
-            if e.args and isinstance(e.args[0], dict):
-                event = e.args[0].get("event", "")
+            except ConnectionFailure as e:
+                # Upstream raises ConnectionFailure for ms.channel.timeOut and
+                # ms.channel.clientDisconnect events during the initial handshake.
+                # Per upstream's own diagnostics, ms.channel.timeOut means
+                # "connection not accepted on TV, or token missing/incorrect" — so
+                # treat it as a token rejection. ms.channel.clientDisconnect is more
+                # ambiguous; treat it as transient.
+                elapsed = time.monotonic() - t0
+                event = ""
+                if e.args and isinstance(e.args[0], dict):
+                    event = e.args[0].get("event", "")
 
-            if event == "ms.channel.timeOut" and use_existing_token and token_exists:
-                logger.warning(f"TV {self.tv_ip} rejected token (event={event}, elapsed={elapsed:.2f}s) — deleting and re-pairing...")
-                self.token_file.unlink()
-                return await self._try_connect(use_existing_token=False, attempt=attempt + 1)
+                if event == "ms.channel.timeOut" and self.token_file.exists():
+                    logger.warning(f"TV {self.tv_ip} rejected token (event={event}, elapsed={elapsed:.2f}s) — deleting and re-pairing...")
+                    self.token_file.unlink()
+                    continue
+                else:
+                    logger.warning(f"Channel drop for TV {self.tv_ip} ({event}, attempt {attempt}) after {elapsed:.2f}s, retrying...")
+                    await asyncio.sleep(CHANNEL_DROP_RETRY_DELAY)
+                    continue
+
+            except Exception as e:
+                logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
+                return False
+
+        logger.warning(f"Giving up connecting to TV at {self.tv_ip} after {CONNECT_MAX_ATTEMPTS} attempts")
+        return False
+
+    async def _acquire_token(self) -> bool:
+        """
+        Trigger first-time pairing and wait for the TV to issue a token.
+
+        Retries internally with a delay sized for human reaction time, since
+        the user has to physically approve the prompt on the TV. Returns True
+        if a token was written to disk.
+        """
+        for pairing_attempt in range(1, PAIRING_MAX_RETRIES + 1):
+            if pairing_attempt == 1:
+                logger.info(f"No token for TV {self.tv_ip}, waiting for pairing approval on TV...")
             else:
-                logger.warning(f"Channel drop for TV {self.tv_ip} ({event}, attempt {attempt}) after {elapsed:.2f}s, retrying...")
-                await asyncio.sleep(CHANNEL_DROP_RETRY_DELAY)
-                return await self._try_connect(use_existing_token=use_existing_token, attempt=attempt + 1)
+                logger.info(f"Retrying pairing for TV {self.tv_ip} ({pairing_attempt}/{PAIRING_MAX_RETRIES})...")
+                await asyncio.sleep(PAIRING_RETRY_DELAY)
 
-        except Exception as e:
-            logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
-            return False
+            try:
+                self.tv = SamsungTVAsyncArt(
+                    host=self.tv_ip,
+                    port=8002,
+                    token_file=str(self.token_file),
+                    timeout=AUTH_TIMEOUT,
+                    name=CLIENT_NAME
+                )
+                try:
+                    await self.tv.available()
+                except Exception:
+                    pass  # Expected disconnect after token issuance — ignore
+            except Exception as e:
+                logger.debug(f"Pairing attempt {pairing_attempt} for TV {self.tv_ip}: {e}")
+
+            if self.token_file.exists():
+                logger.info(f"Token received for TV {self.tv_ip}")
+                await asyncio.sleep(2)  # Let TV finalize before we reconnect
+                return True
+
+        return False
 
     async def is_in_art_mode(self) -> bool:
         """Check if the TV is currently in art mode (not being used for other content)"""
