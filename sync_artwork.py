@@ -302,23 +302,30 @@ class TVArtworkSync:
         internal retry loop sized for human reaction time.
         """
         for attempt in range(1, CONNECT_MAX_ATTEMPTS + 1):
+            # Probe before anything else, for two reasons: the pairing flow
+            # can't distinguish "TV unreachable" from "waiting for approval"
+            # (it swallows connection errors), and constructing the client
+            # issues synchronous REST calls that block the event loop for the
+            # full timeout when the TV is unreachable — stalling the other
+            # TVs' in-flight connects past their own handshake timeouts.
+            if not await self._is_tv_reachable():
+                logger.warning(f"Failed to connect to TV at {self.tv_ip} (TV may be off or unreachable)")
+                return False
+
             # Acquire a token first if we don't have one.
             if not self.token_file.exists():
-                # Pairing can't distinguish "TV unreachable" from "waiting for
-                # user approval" (the flow swallows connection errors), so
-                # probe the port first to avoid a misleading pairing message.
-                if not await self._is_tv_reachable():
-                    logger.warning(f"Failed to connect to TV at {self.tv_ip} (TV may be off or unreachable), skipping pairing")
-                    return False
                 if not await self._acquire_token():
                     logger.warning(f"Failed to acquire token for TV {self.tv_ip}, retrying...")
                     await asyncio.sleep(CHANNEL_DROP_RETRY_DELAY)
                     continue
 
-            # Use the token.
+            # Use the token. The constructor performs synchronous REST and
+            # token-negotiation calls internally, so run it in a thread to
+            # keep the event loop free for the other TVs' connects.
             t0 = time.monotonic()
             try:
-                self.tv = SamsungTVAsyncArt(
+                self.tv = await asyncio.to_thread(
+                    SamsungTVAsyncArt,
                     host=self.tv_ip,
                     port=8002,
                     token_file=str(self.token_file),
@@ -398,7 +405,11 @@ class TVArtworkSync:
                 await asyncio.sleep(PAIRING_RETRY_DELAY)
 
             try:
-                self.tv = SamsungTVAsyncArt(
+                # On 2024+ TVs the constructor synchronously opens the remote
+                # channel and waits (up to AUTH_TIMEOUT) for the user to approve
+                # pairing — run it in a thread so it can't block the event loop.
+                self.tv = await asyncio.to_thread(
+                    SamsungTVAsyncArt,
                     host=self.tv_ip,
                     port=8002,
                     token_file=str(self.token_file),
