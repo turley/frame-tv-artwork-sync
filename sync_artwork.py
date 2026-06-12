@@ -304,6 +304,12 @@ class TVArtworkSync:
         for attempt in range(1, CONNECT_MAX_ATTEMPTS + 1):
             # Acquire a token first if we don't have one.
             if not self.token_file.exists():
+                # Pairing can't distinguish "TV unreachable" from "waiting for
+                # user approval" (the flow swallows connection errors), so
+                # probe the port first to avoid a misleading pairing message.
+                if not await self._is_tv_reachable():
+                    logger.warning(f"Failed to connect to TV at {self.tv_ip} (TV may be off or unreachable), skipping pairing")
+                    return False
                 if not await self._acquire_token():
                     logger.warning(f"Failed to acquire token for TV {self.tv_ip}, retrying...")
                     await asyncio.sleep(CHANNEL_DROP_RETRY_DELAY)
@@ -359,6 +365,22 @@ class TVArtworkSync:
 
         logger.warning(f"Giving up connecting to TV at {self.tv_ip} after {CONNECT_MAX_ATTEMPTS} attempts")
         return False
+
+    async def _is_tv_reachable(self) -> bool:
+        """Probe the TV's websocket port with a plain TCP connect."""
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.tv_ip, 8002),
+                timeout=CONNECTION_TIMEOUT,
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+            return True
+        except (asyncio.TimeoutError, OSError):
+            return False
 
     async def _acquire_token(self) -> bool:
         """
