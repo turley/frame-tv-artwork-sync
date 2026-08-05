@@ -5,6 +5,7 @@ Syncs artwork from a local directory to multiple Samsung Frame TVs
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -18,10 +19,45 @@ import hashlib
 import datetime
 import zoneinfo
 
+from samsungtvws import async_connection
 from samsungtvws.async_art import SamsungTVAsyncArt
 from samsungtvws.async_remote import SamsungTVWSAsyncRemote
 from samsungtvws.exceptions import ConnectionFailure, UnauthorizedError
 from samsungtvws.remote import SamsungTVWS, SendRemoteKey
+
+# Track websockets created during a channel handshake so we can close orphans.
+#
+# Upstream's async open() assigns self.connection only *after* ms.channel.connect
+# arrives. We bound that wait with asyncio.wait_for (a TV can accept the socket
+# and never send the event), but cancelling mid-handshake leaves the websocket
+# open with no reference on the client object — so close() can't reap it and the
+# fd leaks. Wrapping the connect() upstream calls lets us record each socket the
+# moment it exists; _available_bounded() then closes any that wasn't adopted.
+#
+# The recording box is passed via a ContextVar: asyncio.wait_for runs the inner
+# coroutine in a child Task, which copies the current context, so the child sees
+# the same list object the caller created. If upstream ever stops routing through
+# this name the box simply stays empty and we're back to the old behaviour.
+_handshake_sockets: contextvars.ContextVar = contextvars.ContextVar('handshake_sockets', default=None)
+
+if callable(getattr(async_connection, 'connect', None)):
+    _upstream_ws_connect = async_connection.connect
+
+    async def _tracking_ws_connect(*args, **kwargs):
+        conn = await _upstream_ws_connect(*args, **kwargs)
+        box = _handshake_sockets.get()
+        if box is not None:
+            box.append(conn)
+        return conn
+
+    async_connection.connect = _tracking_ws_connect
+else:
+    # Emitted before basicConfig runs, so use warning — the last-resort handler
+    # still surfaces it on stderr.
+    logging.getLogger(__name__).warning(
+        "samsungtvws.async_connection.connect not found; handshake socket tracking "
+        "disabled (upstream API changed). Timed-out handshakes may leak a socket."
+    )
 
 # Patch SamsungTVAsyncArt.get_token to forward the name parameter.
 # Upstream's get_token creates a temporary SamsungTVWS for token negotiation
@@ -332,12 +368,19 @@ class TVArtworkSync:
                     timeout=CONNECTION_TIMEOUT,
                     name=CLIENT_NAME
                 )
-                await self.tv.available()
+                # available() opens the art channel, and upstream's async open()
+                # awaits the ms.channel.connect event with no timeout of its own
+                # (the client's `timeout` only bounds the websocket handshake).
+                # A TV that accepts the socket but never sends that event would
+                # hang this coroutine forever — and since sync_all_tvs gathers
+                # all TVs' connects, that wedges the entire sync loop.
+                await self._available_bounded(CONNECTION_TIMEOUT)
                 logger.info(f"Successfully connected to TV at {self.tv_ip} (attempt {attempt})")
                 return True
 
             except asyncio.TimeoutError:
                 logger.warning(f"Connection to TV at {self.tv_ip} timed out (TV may be off)")
+                await self.close()
                 return False
 
             except UnauthorizedError:
@@ -372,6 +415,31 @@ class TVArtworkSync:
 
         logger.warning(f"Giving up connecting to TV at {self.tv_ip} after {CONNECT_MAX_ATTEMPTS} attempts")
         return False
+
+    async def _available_bounded(self, timeout: float) -> None:
+        """
+        Call available() — which opens the art channel — under a timeout, closing
+        any websocket upstream created during the handshake but never adopted.
+
+        See the _handshake_sockets comment at the top of this file for why the
+        orphan exists. On the success path the socket *is* adopted, so the
+        identity check leaves it alone and close() owns it as usual.
+        """
+        box: List[Any] = []
+        ctx_token = _handshake_sockets.set(box)
+        try:
+            await asyncio.wait_for(self.tv.available(), timeout=timeout)
+        finally:
+            _handshake_sockets.reset(ctx_token)
+            adopted = getattr(self.tv, 'connection', None)
+            for sock in box:
+                if sock is adopted:
+                    continue
+                try:
+                    await sock.close()
+                    logger.debug(f"Closed orphaned handshake socket for TV {self.tv_ip}")
+                except Exception:
+                    pass
 
     async def _is_tv_reachable(self) -> bool:
         """Probe the TV's websocket port with a plain TCP connect."""
@@ -417,17 +485,36 @@ class TVArtworkSync:
                     name=CLIENT_NAME
                 )
                 try:
-                    await self.tv.available()
+                    # Pre-2024 TVs don't get a token from the constructor (upstream
+                    # only forces that handshake for model year >= 24), so the art
+                    # channel opened here is what actually issues it. Bound the wait:
+                    # upstream's async open() blocks on recv() indefinitely if the TV
+                    # never sends ms.channel.connect.
+                    await self._available_bounded(AUTH_TIMEOUT)
                 except Exception:
                     pass  # Expected disconnect after token issuance — ignore
             except Exception as e:
-                logger.debug(f"Pairing attempt {pairing_attempt} for TV {self.tv_ip}: {e}")
+                # Upstream swallows token-write failures and model-year parse errors
+                # into its own debug logs, so this is often the only surface for a
+                # non-writable /tokens mount. Don't hide it behind LOG_LEVEL=DEBUG.
+                logger.warning(f"Pairing attempt {pairing_attempt} for TV {self.tv_ip} failed: {e}")
 
             if self.token_file.exists():
                 logger.info(f"Token received for TV {self.tv_ip}")
                 await asyncio.sleep(2)  # Let TV finalize before we reconnect
                 return True
 
+            # No token this round — drop any half-open channel so the next
+            # attempt starts from a clean connection rather than reusing one
+            # the TV may already consider dead.
+            await self.close()
+            self.tv = None
+
+        logger.warning(
+            f"No token for TV {self.tv_ip} after {PAIRING_MAX_RETRIES} pairing attempts. "
+            f"If you approved the prompt on the TV, check that {TOKEN_DIR} is writable "
+            f"by the container and re-run with LOG_LEVEL=DEBUG."
+        )
         return False
 
     async def is_in_art_mode(self) -> bool:
@@ -933,6 +1020,36 @@ async def sync_all_tvs() -> None:
     logger.info("Sync cycle completed")
 
 
+def check_token_dir_writable() -> None:
+    """
+    Verify TOKEN_DIR exists and is writable before we try to pair.
+
+    Pairing failures caused by a non-writable token directory are otherwise
+    invisible: the TV issues a token, the upstream library's write raises, and
+    upstream swallows the error into a debug log — leaving the service looping
+    on "waiting for pairing approval" forever even though the user approved it.
+    Common causes are a read-only bind mount, a NAS/SMB/NFS share that squashes
+    the container's user, or SELinux without a :z mount flag.
+    """
+    token_dir = Path(TOKEN_DIR)
+    probe = token_dir / '.write-test'
+    try:
+        token_dir.mkdir(parents=True, exist_ok=True)
+        probe.write_text('ok')
+        probe.unlink()
+        return
+    except OSError as e:
+        existing_tokens = list(token_dir.glob('tv_*.txt')) if token_dir.is_dir() else []
+        logger.error(f"Token directory {TOKEN_DIR} is not writable: {e}")
+        logger.error("Tokens cannot be saved, so TV pairing will never complete.")
+        logger.error(f"Check the volume mapped to {TOKEN_DIR} (read-only mount, NAS share "
+                     "permissions, or SELinux — try adding :z to the mount).")
+        if not existing_tokens:
+            logger.error("No existing tokens found either. Exiting.")
+            sys.exit(1)
+        logger.warning("Continuing with existing tokens, but re-pairing will fail.")
+
+
 async def main() -> None:
     """Main loop - sync periodically"""
     logger.info("=" * 60)
@@ -947,6 +1064,8 @@ async def main() -> None:
     if not TV_IPS:
         logger.error("No TV IPs configured. Exiting.")
         sys.exit(1)
+
+    check_token_dir_writable()
 
     while True:
         try:
