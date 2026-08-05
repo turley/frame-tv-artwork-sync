@@ -147,6 +147,7 @@ if KEEPALIVE_INTERVAL < 1:
 UPLOAD_DELAY = 1.0
 DELETE_DELAY = 0.5
 UPLOAD_ATTEMPTS = 2
+POWER_OFF_VERIFY_DELAY = 5.0  # Seconds to wait after a power-off before checking it took effect
 
 
 def is_within_auto_off_window() -> bool:
@@ -749,7 +750,12 @@ class TVArtworkSync:
             return False
 
     async def turn_off(self) -> bool:
-        """Turn off the TV via a separate remote control connection"""
+        """Turn off the TV via a separate remote control connection.
+
+        Verifies afterwards that the TV actually went off, so a TV that gets
+        woken straight back up (e.g. an HDMI-CEC source asserting active-source)
+        is reported instead of being silently assumed off.
+        """
         if DRY_RUN:
             logger.info(f"[DRY RUN] Would turn off TV {self.tv_ip}")
             return True
@@ -770,10 +776,22 @@ class TVArtworkSync:
                 # Frame TVs require holding the power button for 3 seconds to
                 # actually power off. A single press just toggles art mode.
                 await remote.send_commands(SendRemoteKey.hold("KEY_POWER", 3))
-                logger.info(f"Successfully turned off TV {self.tv_ip}")
-                return True
             finally:
                 await remote.close()
+
+            # Verify the power-off actually took. If something wakes the TV back
+            # up, a later cycle retries rather than leaving it silently on.
+            await asyncio.sleep(POWER_OFF_VERIFY_DELAY)
+            try:
+                still_on = await self.tv.on()
+            except Exception:
+                still_on = False  # Can't reach it for status — most likely powered off
+            if still_on:
+                logger.warning(f"TV {self.tv_ip} still reports on after power-off command; will retry next cycle")
+                return False
+
+            logger.info(f"Successfully turned off TV {self.tv_ip}")
+            return True
 
         except Exception as e:
             logger.warning(f"Could not turn off TV {self.tv_ip}: {e}")
@@ -991,30 +1009,36 @@ async def sync_all_tvs() -> None:
         await wait_until_next_sync([])
         return
 
-    tvs_to_sync = []
+    tvs_in_art_mode = []
     for tv_sync in connected_tvs:
         if await tv_sync.is_in_art_mode():
-            tvs_to_sync.append(tv_sync)
+            tvs_in_art_mode.append(tv_sync)
         else:
             logger.info(f"Skipping TV {tv_sync.tv_ip} - not in art mode (may be in use)")
 
-    if not tvs_to_sync:
-        logger.info("No TVs in art mode to sync")
+    if not tvs_in_art_mode:
+        logger.info("No TVs in art mode")
         await asyncio.gather(*[tv.close() for tv in tv_syncs])
         await wait_until_next_sync([])
         return
 
-    local_images = await tvs_to_sync[0].get_local_images() if tvs_to_sync else set()
-    await asyncio.gather(*[tv.sync(local_images) for tv in tvs_to_sync])
-
+    # In the auto-off window, skip the artwork sync and go straight to powering
+    # off — there's no point re-applying slideshow/brightness/image selection on
+    # a TV we're about to turn off. We also don't keep connections alive
+    # afterwards, since there's nothing to keep open on a powered-off TV.
     if is_within_auto_off_window():
         grace_display = int(AUTO_OFF_GRACE_HOURS) if AUTO_OFF_GRACE_HOURS == int(AUTO_OFF_GRACE_HOURS) else AUTO_OFF_GRACE_HOURS
-        logger.info(f"Within auto-off window ({AUTO_OFF_TIME} + {grace_display}h grace), turning off TVs in art mode")
-        for tv_sync in tvs_to_sync:
-            await tv_sync.turn_off()
+        logger.info(f"Within auto-off window ({AUTO_OFF_TIME} + {grace_display}h grace), turning off {len(tvs_in_art_mode)} TV(s) in art mode")
+        await asyncio.gather(*[tv_sync.turn_off() for tv_sync in tvs_in_art_mode])
+        await asyncio.gather(*[tv.close() for tv in tv_syncs])
+        await wait_until_next_sync([])
+        return
+
+    local_images = await tvs_in_art_mode[0].get_local_images()
+    await asyncio.gather(*[tv.sync(local_images) for tv in tvs_in_art_mode])
 
     logger.info(f"Keeping connections alive for {SYNC_INTERVAL_MINUTES} minute(s) until next sync...")
-    await wait_until_next_sync(tvs_to_sync)
+    await wait_until_next_sync(tvs_in_art_mode)
 
     await asyncio.gather(*[tv.close() for tv in tv_syncs])
     logger.info("Sync cycle completed")
