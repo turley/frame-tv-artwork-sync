@@ -458,6 +458,43 @@ class TVArtworkSync:
         except (asyncio.TimeoutError, OSError):
             return False
 
+    def _pair_via_remote_channel(self) -> None:
+        """
+        Open the remote-control channel to trigger pairing and capture the token.
+
+        This is the channel that issues tokens: on approval the TV returns one in
+        the ms.channel.connect payload, and upstream's _check_for_token writes it
+        to the token file. The art channel does *not* — its connect payload only
+        carries the client list, so no token is ever saved.
+
+        Upstream only opens this channel when the TV reports model year >= 24
+        ("initialize token now for 2024+ tv's"), which leaves older sets unable to
+        pair at all: the art channel connects fine, the user approves a prompt,
+        and nothing is ever written. Opening it here regardless of model year is
+        what makes first-time pairing work on pre-2024 TVs.
+
+        Blocking (websocket-client), so call it via asyncio.to_thread.
+        """
+        remote = SamsungTVWS(
+            host=self.tv_ip,
+            port=8002,
+            token_file=str(self.token_file),
+            timeout=AUTH_TIMEOUT,
+            name=CLIENT_NAME,
+        )
+        try:
+            if self.token_file.exists():
+                # Constructing the client already paired us: upstream does that
+                # itself for model year >= 24. No need to open a second channel.
+                return
+            # Blocks until the user approves on the TV (or the timeout expires).
+            remote.open()
+        finally:
+            try:
+                remote.close()
+            except Exception:
+                pass
+
     async def _acquire_token(self) -> bool:
         """
         Trigger first-time pairing and wait for the TV to issue a token.
@@ -473,32 +510,44 @@ class TVArtworkSync:
                 logger.info(f"Retrying pairing for TV {self.tv_ip} ({pairing_attempt}/{PAIRING_MAX_RETRIES})...")
                 await asyncio.sleep(PAIRING_RETRY_DELAY)
 
+            # Pair on the remote-control channel — the only one that issues
+            # tokens. Run it in a thread: it's the blocking client, and it waits
+            # up to AUTH_TIMEOUT for the user to approve on the TV.
             try:
-                # On 2024+ TVs the constructor synchronously opens the remote
-                # channel and waits (up to AUTH_TIMEOUT) for the user to approve
-                # pairing — run it in a thread so it can't block the event loop.
-                self.tv = await asyncio.to_thread(
-                    SamsungTVAsyncArt,
-                    host=self.tv_ip,
-                    port=8002,
-                    token_file=str(self.token_file),
-                    timeout=AUTH_TIMEOUT,
-                    name=CLIENT_NAME
-                )
-                try:
-                    # Pre-2024 TVs don't get a token from the constructor (upstream
-                    # only forces that handshake for model year >= 24), so the art
-                    # channel opened here is what actually issues it. Bound the wait:
-                    # upstream's async open() blocks on recv() indefinitely if the TV
-                    # never sends ms.channel.connect.
-                    await self._available_bounded(AUTH_TIMEOUT)
-                except Exception:
-                    pass  # Expected disconnect after token issuance — ignore
+                await asyncio.to_thread(self._pair_via_remote_channel)
             except Exception as e:
                 # Upstream swallows token-write failures and model-year parse errors
                 # into its own debug logs, so this is often the only surface for a
                 # non-writable /tokens mount. Don't hide it behind LOG_LEVEL=DEBUG.
-                logger.warning(f"Pairing attempt {pairing_attempt} for TV {self.tv_ip} failed: {e}")
+                logger.warning(
+                    f"Pairing attempt {pairing_attempt} for TV {self.tv_ip} "
+                    f"(remote channel) failed: {e}"
+                )
+
+            if not self.token_file.exists():
+                # Fall back to opening the art channel. This is what earlier
+                # versions relied on; keep it so any TV that does issue a token
+                # there still pairs.
+                try:
+                    self.tv = await asyncio.to_thread(
+                        SamsungTVAsyncArt,
+                        host=self.tv_ip,
+                        port=8002,
+                        token_file=str(self.token_file),
+                        timeout=AUTH_TIMEOUT,
+                        name=CLIENT_NAME
+                    )
+                    try:
+                        # Bound the wait: upstream's async open() blocks on recv()
+                        # indefinitely if the TV never sends ms.channel.connect.
+                        await self._available_bounded(AUTH_TIMEOUT)
+                    except Exception:
+                        pass  # Expected disconnect after token issuance — ignore
+                except Exception as e:
+                    logger.warning(
+                        f"Pairing attempt {pairing_attempt} for TV {self.tv_ip} "
+                        f"(art channel) failed: {e}"
+                    )
 
             if self.token_file.exists():
                 logger.info(f"Token received for TV {self.tv_ip}")
