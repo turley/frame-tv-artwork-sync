@@ -32,7 +32,7 @@ from samsungtvws.remote import SamsungTVWS, SendRemoteKey
 # and never send the event), but cancelling mid-handshake leaves the websocket
 # open with no reference on the client object — so close() can't reap it and the
 # fd leaks. Wrapping the connect() upstream calls lets us record each socket the
-# moment it exists; _available_bounded() then closes any that wasn't adopted.
+# moment it exists; _bounded_art_call() then closes any that wasn't adopted.
 #
 # The recording box is passed via a ContextVar: asyncio.wait_for runs the inner
 # coroutine in a child Task, which copies the current context, so the child sees
@@ -369,13 +369,19 @@ class TVArtworkSync:
                     timeout=CONNECTION_TIMEOUT,
                     name=CLIENT_NAME
                 )
-                # available() opens the art channel, and upstream's async open()
+                # Probe with get_artmode_status, not get_content_list. It's the
+                # cheapest art-app request and the most widely supported: 2022
+                # Frames answer it in milliseconds but never answer a
+                # get_content_list with a null category, which left the probe
+                # timing out and the whole TV reported as unreachable.
+                #
+                # This also opens the art channel, and upstream's async open()
                 # awaits the ms.channel.connect event with no timeout of its own
                 # (the client's `timeout` only bounds the websocket handshake).
                 # A TV that accepts the socket but never sends that event would
                 # hang this coroutine forever — and since sync_all_tvs gathers
                 # all TVs' connects, that wedges the entire sync loop.
-                await self._available_bounded(CONNECTION_TIMEOUT)
+                await self._bounded_art_call(self.tv.get_artmode, CONNECTION_TIMEOUT)
                 logger.info(f"Successfully connected to TV at {self.tv_ip} (attempt {attempt})")
                 return True
 
@@ -411,16 +417,23 @@ class TVArtworkSync:
                     continue
 
             except Exception as e:
-                logger.warning(f"Failed to connect to TV at {self.tv_ip}: {e}")
+                # Include the type: upstream asserts on a missing response, and a
+                # bare AssertionError stringifies to "" — which logged as an
+                # empty reason and told nobody anything.
+                logger.warning(f"Failed to connect to TV at {self.tv_ip}: {type(e).__name__}: {e}")
                 return False
 
         logger.warning(f"Giving up connecting to TV at {self.tv_ip} after {CONNECT_MAX_ATTEMPTS} attempts")
         return False
 
-    async def _available_bounded(self, timeout: float) -> None:
+    async def _bounded_art_call(self, make_coro, timeout: float) -> Any:
         """
-        Call available() — which opens the art channel — under a timeout, closing
-        any websocket upstream created during the handshake but never adopted.
+        Run an art-app call — which opens the art channel on first use — under a
+        timeout, closing any websocket upstream created during the handshake but
+        never adopted.
+
+        make_coro is a zero-arg callable returning the coroutine to await, so the
+        coroutine is created inside the ContextVar scope set up here.
 
         See the _handshake_sockets comment at the top of this file for why the
         orphan exists. On the success path the socket *is* adopted, so the
@@ -429,7 +442,7 @@ class TVArtworkSync:
         box: List[Any] = []
         ctx_token = _handshake_sockets.set(box)
         try:
-            await asyncio.wait_for(self.tv.available(), timeout=timeout)
+            return await asyncio.wait_for(make_coro(), timeout=timeout)
         finally:
             _handshake_sockets.reset(ctx_token)
             adopted = getattr(self.tv, 'connection', None)
@@ -540,7 +553,7 @@ class TVArtworkSync:
                     try:
                         # Bound the wait: upstream's async open() blocks on recv()
                         # indefinitely if the TV never sends ms.channel.connect.
-                        await self._available_bounded(AUTH_TIMEOUT)
+                        await self._bounded_art_call(self.tv.get_artmode, AUTH_TIMEOUT)
                     except Exception:
                         pass  # Expected disconnect after token issuance — ignore
                 except Exception as e:
@@ -1032,7 +1045,10 @@ async def wait_until_next_sync(tvs_to_keepalive: List['TVArtworkSync']) -> None:
         if elapsed < sync_interval_seconds:
             for tv_sync in tvs_to_keepalive:
                 try:
-                    await tv_sync.tv.available()
+                    # get_artmode_status, not get_content_list — see the probe in
+                    # _try_connect. Cheaper, and answered by TVs that ignore a
+                    # null-category content list request.
+                    await tv_sync.tv.get_artmode()
                     logger.debug(f"Keepalive ping OK for TV {tv_sync.tv_ip}")
                 except Exception as e:
                     logger.debug(f"Keepalive ping failed for TV {tv_sync.tv_ip}: {e}")
